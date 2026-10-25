@@ -1,0 +1,817 @@
+# Adaptive Automation vs. Bot Defense
+**Kartikay Shukla | Product Engineer Intern Assignment | HULP**
+
+---
+
+## Preface
+
+Before diving in — I've already built something very close to what this assignment is asking about, and it's on my resume.
+
+**[BrowserBot](https://github.com/KARTIKAY-SHUKLA1/BrowserBot)** is a project I built independently before this assignment — an autonomous AI browser agent using LangGraph, Playwright, and Llama-3.3-70b (via Groq). It takes a natural-language goal — like *"go to Flipkart and return the top 3 wireless mouse products with prices"* — and autonomously navigates real websites to accomplish it, with no public API involved. It handles multi-step flows, retries failed actions, streams live progress via SSE, and pauses for human confirmation before any payment-related click.
+
+When I got this assignment, I realized I'd already been solving both problems in practice:
+- **Part 1** — BrowserBot is exactly this problem. I had to make it resilient to real websites. Flipkart works reliably; Amazon blocks it — and I know exactly why.
+- **Part 2** — Because I built a bot, I know firsthand what signals betray automation. That's not something I read about — I experienced it while building.
+
+Everything in this submission comes from that hands-on experience. Where BrowserBot does something one way and a production system would do it better, I'll say so explicitly.
+
+I'll use **online service booking** (cab booking, home services) as the domain throughout — which is directly what HULP does.
+
+---
+
+# Part 1: Resilient Browser Automation
+
+## 1. Architecture
+
+The core idea is a **three-layer system**: an intent layer (what to do), an adaptive execution layer (how to do it right now), and a self-healing layer (what to do when it breaks).
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         User Request                            │
+│              "Book a cab from Connaught Place to IGI"           │
+└─────────────────────────┬───────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Task Orchestrator (FastAPI)                   │
+│   - Accepts goal as natural language                            │
+│   - Assigns run_id, pushes to async execution queue            │
+│   - Streams progress back to user via SSE                       │
+└─────────────────────────┬───────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────────┐
+│               LangGraph Agent (plan → act → observe loop)       │
+│                                                                 │
+│   ┌──────────┐    ┌──────────┐    ┌───────────────┐            │
+│   │  PLAN    │───▶│   ACT    │───▶│    OBSERVE    │            │
+│   │  (LLM)  │    │(Playwright)    │  (page state) │            │
+│   └────▲─────┘    └──────────┘    └───────┬───────┘            │
+│        │                                  │                     │
+│        │          ┌───────────────────────▼─────────────────┐  │
+│        │          │         _should_continue()?              │  │
+│        │          │   done=False AND token budget ok?        │  │
+│        │          └──────────┬──────────────────┬───────────┘  │
+│        │                     │ not done          │ done / END   │
+│        └─────────────────────┘                  ▼              │
+│                                                END              │
+└─────────────────────────────────────────────────────────────────┘
+                                           │
+                          ┌────────────────▼────────────────┐
+                          │       Semantic Browser Wrapper   │
+                          │  (Playwright, no CSS selectors)  │
+                          └────────────────┬────────────────┘
+                                           │
+                          ┌────────────────▼────────────────┐
+                          │    Human-in-the-Loop Gate        │
+                          │  (dangerous actions → SSE pause) │
+                          └─────────────────────────────────┘
+```
+
+**Key Components:**
+
+| Component | Role |
+|---|---|
+| **Task Orchestrator** | Accepts natural-language goals, manages run lifecycle |
+| **LangGraph StateGraph** | Drives the plan→act→observe loop; maintains full agent state |
+| **LLM Planner (Gemini Flash 2.0)** | Decides one action at a time based on current page state. Chosen for this use case: cheapest at scale ($0.075/M tokens), fast, structured outputs native, and strong reasoning for semantic re-planning. Vision capability (screenshot fallback) exists as a last resort for rare icon-only UI edge cases. GPT-4o-mini is a strong alternative — the system is LLM-agnostic |
+| **Semantic Browser Wrapper** | Executes actions using ARIA roles, visible text, labels — never CSS |
+| **Observe Node** | Snapshots page title, URL, and body text back into agent memory |
+| **Safety Gate** | Regex-detects purchase/payment clicks; pauses for human confirmation |
+| **SSE Event Stream** | Pushes live step events to frontend |
+
+---
+
+## 2. Detailed Design
+
+### 2.1 Why the LLM is the Key to Resilience
+
+Traditional browser automation scripts break because they hardcode locators:
+```python
+# Fragile: breaks the moment the site redesigns
+driver.find_element(By.CSS_SELECTOR, ".booking-btn-v2 > span.cta")
+```
+
+The moment the class name changes from `.booking-btn-v2` to `.booking-cta-v3`, the script fails with `ElementNotFound`.
+
+The LLM-driven approach solves this differently. Instead of hardcoding **where** to click, it describes **what** to click:
+
+```python
+# Resilient: "Book Now" is the visible button text, which rarely changes
+click_element(description="Book Now")
+```
+
+Even if the site's internal DOM structure changes completely, as long as the visible text or ARIA role stays similar, the automation keeps working. The LLM looks at the current page snapshot (URL + title + body text) and decides the next semantic action from scratch every step.
+
+### 2.2 Semantic Locator Waterfall
+
+When resolving a description like `"Book Now"`, the browser wrapper tries multiple strategies in order, falling back gracefully:
+
+```
+1. Exact text match       → page.get_by_text("Book Now", exact=True)
+2. Case-insensitive text  → page.get_by_text(re.compile("book now", IGNORECASE))
+3. ARIA roles             → get_by_role("button"|"link"|"menuitem", name=...)
+4. Placeholder            → get_by_placeholder(re.compile(...))
+5. Give up gracefully     → return "Could not find element"
+```
+
+This waterfall means the system handles:
+- Sites that use `<button>` text (step 1/2)
+- Sites that use icon buttons with `aria-label` (step 3)
+- Sites with form inputs labelled via placeholders (step 4)
+
+No CSS selectors. No XPath. No brittle DOM traversal.
+
+### 2.3 Page State as Memory
+
+After every action, the `observe` node reads the page back:
+
+```python
+async def observe(state, browser):
+    # Primary: text snapshot for LLM context
+    snapshot = await browser.get_page_snapshot()
+    # snapshot = "URL: ...\nTitle: ...\nContent: <first 3000 chars of body text>"
+
+    # Fallback: screenshot only when text-based locators failed last step
+    screenshot_b64 = None
+    last_result = state["action_history"][-1].get("result", "")
+    if "could not find" in last_result.lower() or "not found" in last_result.lower():
+        screenshot_bytes = await browser.page.screenshot()
+        screenshot_b64 = base64.b64encode(screenshot_bytes).decode()
+
+    return {"page_content": snapshot, "screenshot": screenshot_b64}
+```
+
+Text snapshot is the default — cheap, fast, sufficient for 95%+ of steps. The screenshot is only captured when the previous action failed to find an element, triggering the vision fallback path. This avoids the memory and latency cost of taking screenshots every step.
+
+### 2.4 Retry and Timeout Logic
+
+Every browser action is wrapped in retry + timeout. In my BrowserBot project, I used a flat 0.5s sleep between all retries:
+
+```python
+# What BrowserBot currently does — works, but not optimal
+MAX_RETRIES = 2
+for attempt in range(MAX_RETRIES + 1):
+    try:
+        result = await asyncio.wait_for(coro, timeout=STEP_TIMEOUT)
+        break
+    except asyncio.TimeoutError:
+        if attempt < MAX_RETRIES:
+            await asyncio.sleep(0.5)  # flat delay — not ideal
+            continue
+```
+
+Building BrowserBot taught me two problems with this approach:
+
+1. **Flat sleep is wrong.** If a site is slow, 0.5s is too short. If it's a network blip, 0.5s twice is fine. Exponential backoff (0.5s → 1s → 2s) is the right pattern — gives the site progressively more time to recover.
+
+2. **Not all failures should be retried.** A `TimeoutError` means the element might appear if we wait. But `"Could not find element"` means the element genuinely doesn't exist right now — retrying it 2 more times wastes 30 seconds for no reason.
+
+**What the production system should do:**
+
+```python
+STEP_TIMEOUT = 15.0
+
+async def execute_with_smart_retry(coro, action: str, max_retries: int = 2):
+    for attempt in range(max_retries + 1):
+        try:
+            return await asyncio.wait_for(coro, timeout=STEP_TIMEOUT)
+
+        except asyncio.TimeoutError:
+            # Worth retrying — site might just be slow
+            if attempt < max_retries:
+                backoff = 0.5 * (2 ** attempt)  # 0.5s, 1s, 2s
+                await asyncio.sleep(backoff)
+                continue
+            return f"Action timed out after {max_retries + 1} attempts"
+
+        except Exception as exc:
+            err = str(exc).lower()
+            # "not found" errors: no point retrying, fail immediately
+            if any(phrase in err for phrase in ["not found", "could not find", "no element"]):
+                return f"Element not found — skipping retries: {exc}"
+            # Other errors (network, crash): worth retrying with backoff
+            if attempt < max_retries:
+                await asyncio.sleep(0.5 * (2 ** attempt))
+                continue
+            return f"Action failed after {max_retries + 1} attempts: {exc}"
+```
+
+If all retries fail, the result string is fed back into the LLM's next plan step. The LLM can then decide: *"The click timed out. Let me scroll down first and try again."*
+
+### 2.5 LLM JSON Recovery — and Why I'd Do It Differently in Production
+
+In BrowserBot, I handle malformed LLM JSON with two regex-based recovery layers:
+
+```python
+# Layer 1: sanitize literal newlines inside JSON strings
+def _sanitize_json(s: str) -> str:
+    # walks char-by-char, escapes \n inside string values
+
+# Layer 2: regex-extract key fields if JSON.parse still fails
+def _recover_json(raw: str) -> Optional[dict]:
+    action = re.search(r'"action"\s*:\s*"([^"]+)"', raw)
+    done   = re.search(r'"done"\s*:\s*(true|false)', raw)
+    args   = re.search(r'"args"\s*:\s*(\{[^}]*\})', raw)
+    # reconstruct minimal valid dict from recovered fields
+```
+
+This works — but building it showed me the real problem: I'm fighting the LLM's output after the fact, with fragile regex. It breaks on nested JSON, on multi-line `final_answer` strings, and on any LLM that decides to add commentary before the JSON object.
+
+**The right solution is to eliminate the problem at the source using structured outputs / tool calling:**
+
+```python
+from langchain_google_genai import ChatGoogleGenerativeAI
+from pydantic import BaseModel
+from typing import Literal
+
+class BrowserAction(BaseModel):
+    action: Literal["navigate_to", "click_element", "type_text",
+                    "press_key", "extract_text", "finish"]
+    url: str | None = None           # for navigate_to
+    description: str | None = None   # for click_element, type_text, extract_text
+    text: str | None = None          # for type_text
+    key: str | None = None           # for press_key
+    done: bool = False
+    final_answer: str = ""
+
+# Force the LLM to return a valid BrowserAction — no freeform JSON
+llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0)
+structured_llm = llm.with_structured_output(BrowserAction)
+
+# In the plan node — always returns a valid BrowserAction object, never raw text
+planned_action: BrowserAction = await structured_llm.ainvoke(messages)
+```
+
+Gemini Flash 2.0 supports structured outputs natively. With structured outputs, `json.JSONDecodeError` becomes impossible — the LLM is constrained to return a valid schema at the API level. No sanitization, no regex recovery needed.
+
+> **Note:** In my BrowserBot side project I used Groq + Llama-3.3-70b with manual regex JSON recovery — that worked fine for a prototype. For HULP's production system, structured outputs is the right approach. Gemini Flash 2.0 also has vision capability as a last-resort fallback: in the rare case where both text-based semantic locators AND LLM text re-planning fail (e.g., an icon-only button with no text or ARIA label), a screenshot can be passed to the LLM to locate elements visually. This covers maybe 5% of edge cases — Layers 1 and 2 handle the other 95%.
+
+### 2.6 Human-in-the-Loop Safety Gate
+
+When the LLM plans to click something that matches purchase/payment patterns:
+
+```python
+_DANGEROUS_RE = re.compile(
+    r"\b(buy|purchase|checkout|pay|payment|confirm\s+order|place\s+order|...)\b",
+    re.IGNORECASE
+)
+```
+
+The action is intercepted. Instead of executing:
+1. A `paused` event is pushed to the SSE stream
+2. A `ConfirmationRequest` object is stored with `run_id` as key
+3. The agent `await`s the human decision (up to 120 seconds)
+4. The human responds via a separate `/confirm/{run_id}` endpoint
+5. If confirmed → re-plan to execute; if denied/timeout → stop safely
+
+The whole point is: you never auto-pay on someone's behalf without them explicitly saying yes.
+
+---
+
+## 3. Implementation Details
+
+**Tech Stack:** Python, FastAPI, LangGraph, Playwright, Gemini Flash 2.0 (Google AI), React (Vite)
+
+**Key interfaces:**
+
+```python
+# Agent state — the full context carried through the graph
+class AgentState(TypedDict):
+    goal: str                      # natural-language user goal
+    page_content: str              # latest page snapshot
+    action_history: list[dict]     # all past actions + results
+    steps: list[StepRecord]        # structured step log
+    planned_action: Optional[dict] # current plan from LLM
+    done: bool
+    final_answer: str
+    success: bool
+
+# Available browser actions (semantic, no selectors)
+ACTIONS = [
+    "navigate_to(url)",
+    "click_element(description)",
+    "type_text(description, text)",
+    "press_key(key)",
+    "extract_text(description)",
+    "finish()"
+]
+```
+
+**LangGraph topology:**
+
+```
+          ┌──────────────────────────────────────────┐
+          │                  (loop)                  │
+          ▼                                          │
+START ──▶ plan ──▶ act ──▶ observe ──▶ [conditional] ──▶ END
+                                       (done=True or token budget exceeded)
+```
+
+> **Note on step budget:** In BrowserBot I hardcoded `MAX_STEPS = 10`. This works for simple tasks but is too rigid — a multi-city cab booking or a multi-item food order could legitimately need 15–20 steps. In a production system I'd replace the hard cap with a **cost guard**: instead of counting steps, track total tokens consumed per run and stop if it exceeds a budget threshold (e.g., 15,000 tokens). This lets simple tasks finish in 3 steps and complex ones use 25 steps, while still protecting against infinite loops. The LangGraph conditional edge becomes:
+> ```python
+> def _should_continue(state):
+>     if state.get("done"):              return "__end__"
+>     if state["tokens_used"] > 15_000: return "__end__"  # cost guard
+>     return "plan"
+> ```
+
+**SSE event schema:**
+
+```jsonc
+// Step executed
+{"type": "step", "step": {"action": "click_element(...)", "result": "Clicked button 'Book Now'"}}
+
+// Agent paused for confirmation
+{"type": "paused", "run_id": "abc123", "pending_action": {...}, "message": "Agent wants to click 'Confirm Payment'..."}
+
+// Run complete
+{"type": "done", "result": {"goal": "...", "steps_taken": [...], "final_answer": "...", "success": true}}
+```
+
+---
+
+## 4. Worked Examples
+
+### Example A: Successful cab booking flow
+
+**Goal:** `"Book a cab from Connaught Place to IGI Airport on OlaCabs for tomorrow 8am"`
+
+| Step | Action | LLM Reasoning | Result |
+|---|---|---|---|
+| 1 | `navigate_to("https://www.olacabs.com")` | Start at home page | Title: OlaCabs \| Online Cab Booking |
+| 2 | `click_element("Rides")` | Select service type | Clicked link 'Rides' |
+| 3 | `type_text("Pickup location", "Connaught Place")` | Fill origin | Typed into textbox |
+| 4 | `type_text("Drop location", "IGI Airport")` | Fill destination | Typed into textbox |
+| 5 | `click_element("Search Cabs")` | Trigger search | Clicked button |
+| 6 | `extract_text("page")` | See available options | Returns list of cab types + ETAs |
+| 7 | `click_element("Book Mini")` | Select cab type | Clicked |
+| 8 | ⚠️ **Safety gate** on `click_element("Confirm Booking")` | Matches `confirm\s+order` regex | → SSE `paused` event sent to user |
+| 9 | User confirms via `/confirm/abc123` | Human-in-the-loop | Execution resumes |
+| 10 | `finish()` | Goal complete | `success: true` |
+
+**Result:** Booking completed. Human approved the final confirmation step.
+
+---
+
+### Example B: Edge case — UI redesign mid-run (the hard case)
+
+**Scenario:** The site changed its button from `"Book Now"` to `"Reserve Instantly"` overnight.
+
+**What a traditional script does:**
+```
+ElementNotFoundError: .book-now-btn not found
+```
+Script crashes. Engineer gets paged at 2am. Script is manually patched. Repeat next week.
+
+**What the LLM-driven agent does:**
+
+| Step | Action | Result |
+|---|---|---|
+| 1 | `navigate_to(url)` | Page loaded |
+| 2 | `click_element("Book Now")` | **Failed** — "Could not find element matching 'Book Now'" |
+| 3 | LLM re-plans based on page snapshot | LLM sees `"Reserve Instantly"` in body text |
+| 4 | `click_element("Reserve Instantly")` | ✅ Clicked — booking flow resumes |
+| 5 | `extract_text("page")` | Cab options and ETAs loaded |
+| 6 | `click_element("Book Mini")` | ✅ Clicked |
+| 7 | `finish()` | `success: true` |
+
+**Why this works:** The observe node fed back the full page body text including `"Reserve Instantly"` as a visible element. The LLM's next plan naturally adapted. No code change required.
+
+---
+
+## 5. Failure Modes and Trade-offs
+
+| Failure | Detection | Recovery | What I chose NOT to handle |
+|---|---|---|---|
+| **LLM gives malformed JSON** | `json.JSONDecodeError` | Production fix: use Gemini Flash 2.0's structured outputs — LLM is forced to return a valid schema, JSON errors become impossible. (In BrowserBot I used regex recovery as a prototype approach — works but fragile) | Fully corrupted API responses — just fail gracefully |
+| **Action timeout (15s)** | `asyncio.TimeoutError` | Retry up to 2× with 0.5s backoff | Retries beyond 2× (diminishing returns, costs tokens) |
+| **Token budget exceeded** | `tokens_used > 15,000` | Force `END`, return what's collected so far | Open-ended tasks that legitimately need more tokens — those should be broken into sub-tasks |
+| **Site uses CAPTCHA** | Body text contains "CAPTCHA"/"verify" | LLM notes it in final_answer | Auto-solving CAPTCHAs (out of scope, ethically questionable) |
+| **Site blocks bot fingerprint** | `navigate_to` returns error page | LLM notes it; try alternative URL | Full stealth mode (out of scope for this system) |
+| **Dangerous click (payment)** | Regex match on click description | Human confirmation via SSE pause | Autonomous payment without human approval |
+
+**Key trade-off:** Semantic locators try 4–5 strategies per action, so they're slower than a single CSS selector. For a real-time system that's a concern — but HULP's automation runs async in the background, so a 200ms locator resolution is totally fine.
+
+---
+
+## 6. Operations: Monitoring, Alerting, Scaling, Cost
+
+### Monitoring
+- **Step success rate per run:** what % of steps succeed on first attempt vs. retry
+- **Run completion rate:** % of runs that reach `success: true`
+- **LLM JSON parse failure rate:** tracks prompt quality degradation
+- **P95 step latency:** alert if semantic locator resolution gets slow
+
+### Alerting
+- Alert if run completion rate drops below 70% in a 1-hour window → likely a site redesign
+- Alert if structured output schema validation fails (should be near-zero with Gemini Flash 2.0 — a spike means model API issue)
+- Alert on Safety Gate trigger rate spike → possible LLM misbehaviour
+
+### Scaling
+- Each run gets its own Playwright browser context (isolated, parallelisable)
+- Runs are queued async; the FastAPI + asyncio event loop handles concurrency
+- Horizontal scaling: multiple worker pods, each running N concurrent browser contexts
+- Browser contexts are far cheaper than full browser instances (shared process)
+- **Memory limit per pod:** Each browser context uses ~50–150MB RAM. A pod with 8GB RAM can safely run ~40–60 concurrent contexts. Beyond that, spin up another pod.
+- **Playwright crash recovery:** If a browser context crashes mid-run, the `AgentState` is already persisted in memory (and optionally Redis for distributed setups). The run can be retried from the last successful step rather than from scratch — partial progress is not lost.
+
+### Cost
+
+Cost scales linearly with run volume and task complexity:
+
+- **~\$0.001/run** at Gemini Flash 2.0 pricing (\$0.075/M input tokens, ~5,000–8,000 tokens per 10-step run) — significantly cheaper than alternatives
+- **At 1,000 runs/day** → ~\$1/day (~\$30/month)
+- **At 10,000 runs/day** → ~\$10/day — Gemini Flash remains cost-effective even at high volume; self-hosting an open-source model is the v2 path if Google AI pricing becomes a concern
+- **LLM choice rationale:** Gemini Flash 2.0 is chosen for cost ($0.075/M tokens — cheapest at scale), speed, strong reasoning for semantic re-planning, and native structured outputs. Vision capability exists as a last-resort fallback for icon-only UI edge cases — but in practice, semantic text locators + LLM text re-planning handle 95%+ of UI changes without needing screenshots. My BrowserBot side project used Groq + Llama for prototyping; GPT-4o-mini is a strong production alternative — the system is LLM-agnostic, swapping is one config line.
+- **Playwright:** Runs headless in production (set `PLAYWRIGHT_HEADLESS=true`). CPU-bound, scales with worker count.
+- **Optimization lever:** Cache the `observe` snapshot for repeated identical URLs to avoid redundant LLM calls.
+
+---
+
+# Part 2: Bot Prevention Without CAPTCHAs
+
+## 1. Architecture
+
+The key insight: **don't try to detect bots at one point in time — build a continuous behavioral fingerprint and score every session in real time.**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       Client (Browser)                          │
+│   - JS Telemetry Collector (mouse, keyboard, scroll, timing)    │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ Telemetry beacon (async POST)
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Signal Ingestion Layer                        │
+│   - Receives passive behavioral signals                         │
+│   - Enriches with network/TLS fingerprint (server-side)         │
+│   - Pushes to Redis for real-time scoring                       │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Risk Scoring Engine                           │
+│                                                                 │
+│   ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐ │
+│   │  Behavioral  │  │   Network    │  │   Temporal/Rate      │ │
+│   │  Signals     │  │  Signals     │  │   Signals            │ │
+│   └──────┬───────┘  └──────┬───────┘  └──────┬───────────────┘ │
+│          └─────────────────┼─────────────────┘                 │
+│                            ▼                                    │
+│                   Weighted Risk Score (0–100)                   │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Policy Enforcement Layer                      │
+│                                                                 │
+│   Score 0–30  → Allow (trusted)                                 │
+│   Score 30–60 → Soft friction (add delay, shadow-limit)         │
+│   Score 60–80 → Hard friction (require email OTP for checkout)  │
+│   Score 80+   → Block + log for review                          │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key Components:**
+
+| Component | Role |
+|---|---|
+| **JS Telemetry Collector** | Passive browser signals: mouse entropy, scroll, typing patterns |
+| **Signal Ingestion Layer** | Receives beacons, enriches with server-side signals (IP, TLS) |
+| **Redis Session Store** | Per-session signal buffer + rolling score, TTL-managed |
+| **Risk Scoring Engine** | Computes weighted score from all signal categories |
+| **Policy Enforcement** | Tiered response: allow / soft-friction / hard-friction / block |
+| **Audit Log** | All decisions stored for review and model retraining |
+
+---
+
+## 2. Detailed Design
+
+### 2.1 Signal Categories
+
+**Category A — Behavioral (client-side, hardest to fake at scale)**
+
+| Signal | What it measures | Bot indicator |
+|---|---|---|
+| Mouse movement entropy | Randomness of mouse path | Too linear, too jittery, or zero |
+| Click timing | Time between page load and first click | <100ms or exactly periodic |
+| Scroll velocity | Natural deceleration curve | Constant velocity (scripted) |
+| Keystroke timing | Inter-key intervals | Programmatic fill is instant |
+| Focus/blur events | Tab switching, window focus | Bots rarely trigger these |
+| Touch vs. mouse | Mobile users use touch | Mouse events on a mobile UA |
+
+**Category B — Network (server-side)**
+
+| Signal | What it measures | Bot indicator |
+|---|---|---|
+| IP reputation | Known bot/datacenter IP ranges | AWS/GCP egress IPs |
+| TLS fingerprint (JA3) | Browser TLS handshake signature | Playwright/curl JA3 hashes |
+| User-Agent consistency | Does UA match browser capabilities | Playwright UA says Chrome but JA3 differs |
+| Request rate | Requests per second per IP/session | Burst patterns |
+| Header ordering | HTTP/2 header frame order | Differs between real browsers and automation tools |
+
+**Category C — Temporal/Rate**
+
+| Signal | Bot indicator |
+|---|---|
+| Time on page before submitting a form | <2 seconds is suspicious |
+| Number of orders from IP in 1 hour | Hard limit |
+| Account age vs. order frequency | New account + 10 orders in 1 hour |
+| Identical order payloads | Same pickup/drop repeated exactly |
+
+### 2.2 Risk Scoring Algorithm
+
+```python
+def compute_risk_score(session: SessionSignals) -> int:
+    score = 0
+
+    # Behavioral signals (max 40 points)
+    if session.mouse_entropy < 0.1:           score += 20  # too linear / absent
+    if session.click_latency_ms < 100:        score += 10  # inhuman speed
+    if session.keystroke_uniformity > 0.95:   score += 10  # programmatic fill
+
+    # Network signals (max 40 points)
+    if session.ip_in_datacenter_range:        score += 20
+    if session.ja3_matches_known_bot:         score += 20
+
+    # Temporal signals (max 20 points)
+    if session.time_on_page_sec < 2:          score += 10
+    if session.orders_per_hour > 5:           score += 10
+
+    return min(score, 100)
+```
+
+**Why these thresholds specifically?**
+- `mouse_entropy < 0.1` — Playwright generates **zero** real mouse events on a synthetic click. Entropy literally = 0. The 0.1 threshold is generous to catch even bots that inject minimal fake movement.
+- `click_latency < 100ms` — Human reaction time (stimulus → click) is minimum ~150ms, well-established in HCI research. Anything under 100ms is physically impossible for a human.
+- `keystroke_uniformity > 0.95` — `page.fill()` types all characters atomically with 0ms inter-key delay (uniformity = 1.0). Real humans have uniformity ~0.3–0.6 depending on typing speed. 0.95 catches programmatic fills while ignoring fast typists.
+
+These thresholds are starting points — they're set conservatively to minimize false positives. In practice they'd be calibrated against real traffic distributions.
+
+This is deterministic and auditable — when a legitimate user gets wrongly blocked, the support team can pull their session, see exactly which signals fired and why, and reset their score manually. A black-box ML model can't offer that transparency. Auditability is the main reason to start with rules rather than ML — the deterministic v1 system also generates clean training labels for the v2 model.
+
+**v2 upgrade path — ML scoring:**
+Once the audit log accumulates enough labeled data (blocked sessions confirmed as bots, passed sessions confirmed as legitimate), the rule-based scorer gets replaced by an **XGBoost or LightGBM model**. The hand-written thresholds above become feature engineering — the same signals feed the model, but the model learns optimal decision boundaries from data rather than having them hardcoded. This is exactly how Stripe Radar evolved: hand-written rules first, gradient boosted trees second. The deterministic v1 system generates the training labels for v2.
+
+### 2.3 Tiered Response (No CAPTCHAs)
+
+```
+Score 0–30:   ALLOW
+              Normal flow, no friction
+
+Score 30–60:  SOFT FRICTION
+              - Add 500ms artificial delay on API responses (slows down high-volume bots)
+              - Shadow-rate-limit: the request IS accepted and queued, but processed with lowest priority. From the user's perspective, the booking is "processing" — real users wait a few seconds and get their result. For high-volume bots running hundreds of parallel requests, the artificial throughput cap makes bulk abuse economically slow. The session is flagged for async human review.
+              - Log session for async review
+
+Score 60–80:  HARD FRICTION
+              - Require email/phone OTP before checkout
+              - This is invisible to a real user who has their phone nearby
+              - A bot has no access to the OTP inbox → blocked effectively
+
+Score 80+:    BLOCK
+              - Return 429 with a generic message ("Something went wrong")
+              - Log full session for IP-level block review
+              - Don't tell the bot WHY it was blocked (adversarial hardening)
+```
+
+**Why no CAPTCHAs?** CAPTCHAs are a blunt instrument. They:
+1. Add friction for *every* user, not just bots
+2. Have known weaknesses (ML-based CAPTCHA solvers, CAPTCHA farms)
+3. Hurt conversion rates — research consistently shows they cost ~10% of legitimate completions
+
+The OTP step (score 60–80) acts as a targeted challenge only for high-risk sessions. It's also something real users are already comfortable with for security reasons.
+
+### 2.4 TLS Fingerprinting (JA3)
+
+This is one of the strongest signals. When a browser opens an HTTPS connection, the TLS `ClientHello` message contains a specific set of cipher suites and extensions. The JA3 hash is an MD5 of these fields.
+
+Real Chrome browser → JA3: `ada70210d4b8e024bcce` (example)  
+Playwright Chromium → JA3: `b32309a26951912be7dba376398abc3b` (different, even with same UA string)
+
+This is why my BrowserBot README notes: *"Amazon aggressively blocks headful Playwright instances even with a real user agent."* Amazon uses exactly this technique — the JA3 hash betrays the Playwright context even though the user-agent string says "Chrome." I set a realistic user-agent in BrowserBot's `browser.py`, but that doesn't change the TLS handshake.
+
+### 2.5 Honeypot Fields
+
+Add a hidden form field (`display: none` in CSS) that real users never see or fill. Bots that scrape the DOM and fill all fields will fill it:
+
+```html
+<input type="text" name="website" style="display:none" tabindex="-1" autocomplete="off">
+```
+
+```python
+# Server-side check
+if request.form.get("website"):  # honeypot was filled
+    session_score += 30
+```
+
+Zero friction for real users. Catches unsophisticated bots immediately.
+
+---
+
+## 3. Implementation Details
+
+**Tech Stack:** Node.js (Express), Redis, BullMQ (for async score processing), PostgreSQL (audit log), JavaScript (client telemetry)
+
+> In one of my other previous projects (**DevLinkr**), I've used Redis + BullMQ for async job queuing with exponential backoff — so this tech stack is familiar territory, not something I'm picking up fresh.
+
+**Client-side telemetry collector:**
+
+```javascript
+class TelemetryCollector {
+    constructor(sessionId) {
+        this.sessionId = sessionId;
+        this.signals = { mousePoints: [], clickTimings: [], keyTimings: [] };
+        this._attachListeners();
+    }
+
+    _attachListeners() {
+        document.addEventListener('mousemove', (e) => {
+            this.signals.mousePoints.push({ x: e.clientX, y: e.clientY, t: Date.now() });
+        });
+        document.addEventListener('keydown', () => {
+            this.signals.keyTimings.push(Date.now());
+        });
+    }
+
+    computeMouseEntropy() {
+        // Shannon entropy of direction-change angles between consecutive mouse points
+        const angles = [];
+        for (let i = 2; i < this.signals.mousePoints.length; i++) {
+            const dx1 = this.signals.mousePoints[i-1].x - this.signals.mousePoints[i-2].x;
+            const dy1 = this.signals.mousePoints[i-1].y - this.signals.mousePoints[i-2].y;
+            const dx2 = this.signals.mousePoints[i].x - this.signals.mousePoints[i-1].x;
+            const dy2 = this.signals.mousePoints[i].y - this.signals.mousePoints[i-1].y;
+            angles.push(Math.atan2(dy2, dx2) - Math.atan2(dy1, dx1));
+        }
+        return shannonEntropy(angles);  // 0 = perfectly linear, 1 = chaotic/human
+    }
+
+    beacon() {
+        const timings = this.signals.keyTimings;
+        const intervals = timings.slice(1).map((t, i) => t - timings[i]);
+        const uniformity = intervals.length > 1
+            ? 1 - (stddev(intervals) / mean(intervals))
+            : 0;
+
+        navigator.sendBeacon('/api/telemetry', JSON.stringify({
+            sessionId: this.sessionId,
+            mouseEntropy: this.computeMouseEntropy(),
+            clickLatency: this.signals.clickTimings[0] - performance.timing.navigationStart,
+            keystrokeUniformity: uniformity
+        }));
+    }
+}
+```
+
+**Redis session state:**
+
+```redis
+# Per-session risk score (TTL 30 minutes)
+SET session:{id}:score 45 EX 1800
+
+# Per-IP rolling order count (1-hour window)
+INCR ip:{ip}:orders:1h
+EXPIRE ip:{ip}:orders:1h 3600
+
+# JA3 hash blocklist (persistent set)
+SADD ja3_blocklist "b32309a26951912be7dba376398abc3b"
+```
+
+**Risk scoring endpoint:**
+
+```javascript
+app.post('/api/telemetry', async (req, res) => {
+    const { sessionId, mouseEntropy, clickLatency, keystrokeUniformity } = req.body;
+
+    const ja3 = extractJA3FromRequest(req);     // from nginx-ja3 module header
+    const ip = req.ip;
+    const isDatacenterIP = await checkIPReputation(ip);     // against known ASN list
+    const isKnownBotJA3 = await redis.sismember('ja3_blocklist', ja3);
+    const ordersThisHour = parseInt(await redis.get(`ip:${ip}:orders:1h`) || '0');
+
+    const score = computeRiskScore({
+        mouseEntropy, clickLatency, keystrokeUniformity,
+        isDatacenterIP, isKnownBotJA3, ordersThisHour
+    });
+
+    await redis.set(`session:${sessionId}:score`, score, 'EX', 1800);
+    res.json({ ok: true });
+});
+```
+
+---
+
+## 4. Worked Examples
+
+### Example A: Legitimate user booking a home service
+
+1. User opens HULP booking page on Chrome mobile
+2. Telemetry collects: natural mouse movements (entropy = 0.73), 3.2s on page, human typing intervals (uniformity = 0.4)
+3. Click latency = 1,240ms — clearly human
+4. JA3 matches real Chrome mobile fingerprint
+5. IP is a residential Airtel connection (not datacenter)
+6. **Score: 8 → ALLOW**
+7. User completes booking with zero friction. No awareness of any defense layer.
+
+---
+
+### Example B: Bot attempting bulk fake slot bookings (the hard case)
+
+**Scenario:** A competitor bulk-books slots to make HULP appear unavailable. They use a Playwright script with a spoofed user-agent.
+
+| Check | Signal Value | Score Contribution |
+|---|---|---|
+| Mouse entropy | 0.0 (no mouse events) | +20 |
+| Click latency | 48ms (sub-human) | +10 |
+| Keystroke uniformity | 0.99 (programmatic `page.fill()`) | +10 |
+| IP reputation | AWS us-east-1 egress | +20 |
+| JA3 hash | Matches known Playwright fingerprint | +20 |
+| Time on page | 0.3 seconds | +10 |
+| **Total** | | **90 → BLOCK** |
+
+The request receives `429` with a generic error. The attacker doesn't know if they were rate-limited or if there's a real server issue. The session is logged for IP-level blocking.
+
+**Edge case within this example:** What if the attacker switches to a residential proxy? The IP reputation check (+20) is now missed. Score drops to 70 — still in the **Hard Friction** zone. They now hit the OTP step. Since they have no access to the OTP inbox, they're effectively blocked regardless. The behavioral and JA3 signals do the heavy lifting even without the IP signal.
+
+---
+
+## 5. Failure Modes and Trade-offs
+
+| Failure | Detection | Recovery | What I chose NOT to handle |
+|---|---|---|---|
+| **False positive — real user flagged** | High score but successful OTP completion | OTP success resets score to 0 for the session | Power users who click extremely fast — accept a small FP rate |
+| **Telemetry blocked (ad blocker)** | No beacon received for session | Fall back to network signals only; score on those alone | Forcing telemetry through (adversarial to legitimate privacy users) |
+| **Bot with residential proxy + slow timing** | JA3 still mismatches real Chrome | JA3 signal alone flags it | Bots that patch their Playwright binary to match JA3 — requires dedicated threat response |
+| **JA3 list goes stale** | New Playwright version changes hash | Regular JA3 list sync via threat intel feed | Maintaining a fully up-to-date JA3 database in-house — use a vendor (DataDome, Cloudflare) |
+| **OTP abuse via SIM farm** | Many OTP requests from same IP | Rate-limit OTP sends: max 3/hour per IP | Nation-state-level abuse (out of scope for a startup) |
+
+**Biggest trade-off:** Passive behavioral signals require JavaScript. If users have JS disabled or use aggressive privacy tools, telemetry is incomplete. I chose to fall back to network-only scoring rather than block non-JS users — blocking them would harm legitimate privacy-conscious users and is the wrong call.
+
+---
+
+## 6. Operations: Monitoring, Alerting, Scaling, Cost
+
+### Monitoring
+- **Score distribution histogram:** should be bimodal (most users < 30, bots > 70). If it flattens, signals are degrading.
+- **OTP trigger rate:** % of sessions hitting hard-friction tier. A spike means bot wave; a slow creep means signal drift.
+- **False positive rate:** Sessions that passed OTP but were later flagged as fraud — correlate with their score at booking time.
+- **Block rate per endpoint:** Spikes on specific endpoints signal targeted attacks.
+
+### Alerting
+- Block rate > 5% in any 5-minute window → possible attack wave, auto-scale filtering workers
+- OTP trigger rate > 15% → behavioral thresholds may be too aggressive, review
+- Telemetry receive rate drops below 80% → check beacon endpoint health
+
+### Scaling
+- **Telemetry ingestion:** Stateless Node.js workers behind a load balancer. Each beacon is a lightweight Redis write.
+- **Score computation:** Runs synchronously on telemetry receipt. Light enough for single-threaded async workers.
+- **Redis:** Redis Cluster for horizontal scaling. Session scores are small (< 1KB each). At 100K concurrent sessions: ~100MB RAM.
+- **JA3 extraction:** Done at the nginx layer via `nginx-ja3` module — zero app-layer overhead.
+
+### Cost
+- **Redis:** ~\$50/month for a managed 1GB cluster at 100K sessions
+- **IP reputation API:** ~\$0.001/lookup → ~\$30/day at 30K sessions/day
+- **Optimization:** Cache IP reputation lookups in Redis for 1 hour — same IP isn't re-checked on every request
+
+---
+
+# Bonus: How Does Part 1 Survive Part 2?
+
+This is the most interesting question.
+
+**Would BrowserBot (Part 1) be caught by the Part 2 defenses?**
+
+Honestly — **yes, mostly.** And that's by design.
+
+| Part 2 Defense | BrowserBot's Fate | Why |
+|---|---|---|
+| **Mouse entropy check** | ❌ CAUGHT | Playwright's synthetic click generates no real mouse movement events. Entropy = 0. |
+| **Click latency check** | ❌ CAUGHT | Programmatic clicks fire in 30–80ms — well below the 100ms human threshold. |
+| **JA3 fingerprint** | ❌ CAUGHT | Playwright Chromium has a distinct JA3 hash. Even though BrowserBot sets a realistic user-agent in `browser.py`, the JA3 betrays the automation layer. This is exactly why Amazon blocks BrowserBot — I noted it in my README. The UA string lies; the TLS handshake doesn't. |
+| **Keystroke uniformity** | ❌ CAUGHT | `page.fill()` types all text atomically — no inter-key intervals whatsoever. |
+| **Honeypot fields** | ✅ SURVIVES | BrowserBot uses semantic locators (`get_by_placeholder`, `get_by_label`). It targets fields by visible description, not by filling every DOM element. A `display:none` honeypot would never be targeted. |
+| **OTP hard friction** | ❌ CAUGHT | BrowserBot has no inbox access. It cannot retrieve or enter an OTP. Blocked. |
+
+**Conclusion:** A BrowserBot-style automation scores **60–80** from behavioral and JA3 signals alone (mouse entropy +20, click latency +10, keystroke uniformity +10, JA3 +20 = 60 minimum). If it also runs from a cloud/datacenter IP — which is common for server-deployed automation — the IP reputation check adds another +20, pushing the score to **80+ → hard block**. Even at the lower score of 60, it hits the OTP tier and gets blocked there. Either way, it doesn't get through. An attacker trying to evade would need to: add synthetic mouse movement, add random keystroke delays, use a real Chrome binary (not Playwright's bundled Chromium) to fix JA3, and route through residential proxies. Possible — but it raises cost/request by 10–100x, making bulk abuse economically unviable.
+
+**The real answer for HULP:** If HULP explicitly authorizes users to automate bookings (e.g., corporate accounts), the right solution is **authenticated API tokens** — give those accounts a server-to-server API key so they bypass the browser flow entirely and never hit bot detection. Part 1 (browser automation) is a last resort for sites *without* an API. HULP should build and expose an API for its power users rather than force them through a browser layer designed for human interaction.
+
+---
+
+## Summary
+
+| | Part 1: Automation | Part 2: Bot Defense |
+|---|---|---|
+| **Core idea** | LLM re-plans from observed page state; semantic locators resist UI changes | Multi-signal passive scoring; tiered friction for high-risk sessions only |
+| **Key resilience** | Semantic waterfall + retry + LLM JSON recovery | JA3 fingerprinting + behavioral entropy + OTP gate |
+| **Human in the loop** | Yes — payment actions require explicit confirmation | Yes — OTP only for sessions scoring 60–80 |
+| **Biggest weakness** | JA3 fingerprint betrays Playwright even with spoofed UA | Residential proxies + synthetic mouse movement lower the score |
+| **Monitoring signal** | Run completion rate | Score distribution histogram |
+
+The two systems are genuinely adversarial to each other — which makes building both an interesting exercise in thinking from both sides of the problem.
+
+---
+
+*Kartikay Shukla | kartikayshukla4141@gmail.com | +91 9336166298*
