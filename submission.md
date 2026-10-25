@@ -7,7 +7,7 @@
 
 One of my personal projects — **[BrowserBot](https://github.com/KARTIKAY-SHUKLA1/BrowserBot)** — is already on my resume and happens to be directly relevant to both parts of this assignment. It's an autonomous AI browser agent (LangGraph, Playwright, Llama-3.3-70b) that navigates real websites from a natural-language goal with no public API.
 
-Building it gave me hands-on experience on both sides. For Part 1 — I had to make it resilient to real websites; Flipkart works reliably, Amazon blocks it, and I know exactly why. For Part 2 — because I built a bot, I know firsthand what signals betray automation. That's not something I read about.
+Building it gave me hands-on experience on both sides. For Part 1 — I had to make it resilient to real websites; Flipkart works reliably, Amazon blocks it, and I have a good theory why (likely JA3 fingerprinting — covered in Part 2). For Part 2 — because I built a bot, I know firsthand what signals betray automation. That's not something I read about.
 
 I'll use **online service booking** (cab booking, home services) as the domain throughout — directly what HULP does.
 
@@ -71,7 +71,7 @@ The core idea is a **three-layer system**: an intent layer (what to do), an adap
 | **LLM Planner (Gemini Flash 2.0)** | Decides one action at a time based on current page state. Chosen for this use case: cheapest at scale ($0.075/M tokens), fast, structured outputs native, and strong reasoning for semantic re-planning. Vision capability (screenshot fallback) exists as a last resort for rare icon-only UI edge cases. GPT-4o-mini is a strong alternative — the system is LLM-agnostic |
 | **Semantic Browser Wrapper** | Executes actions using ARIA roles, visible text, labels — never CSS |
 | **Observe Node** | Snapshots page title, URL, and body text back into agent memory |
-| **Safety Gate** | Regex-detects purchase/payment clicks; pauses for human confirmation |
+| **Safety Gate** | LLM-based intent classifier (`ActionRisk`) intercepts irreversible clicks; pauses for human confirmation with transaction details |
 | **SSE Event Stream** | Pushes live step events to frontend |
 
 ---
@@ -388,7 +388,7 @@ class AgentState(TypedDict):
     planned_action: Optional[dict] # current plan from LLM
     done: bool
     final_answer: str
-    success: bool
+    outcome: str  # "success" | "failed" | "incomplete" | "unknown" — set from verified page state
 
 # Available browser actions (semantic, no selectors)
 ACTIONS = [
@@ -451,7 +451,7 @@ START ──▶ plan ──▶ act ──▶ observe ──▶ [conditional] ─
 | 5 | `click_element("Search Cabs")` | Trigger search | Clicked button |
 | 6 | `extract_text("page")` | See available options | Returns list of cab types + ETAs |
 | 7 | `click_element("Book Mini")` | Select cab type | Clicked |
-| 8 | ⚠️ **Safety gate** on `click_element("Confirm Booking")` | Matches `confirm\s+order` regex | → SSE `paused` event sent to user |
+| 8 | ⚠️ **Safety gate** on `click_element("Confirm Booking")` | `ActionRisk` classifier sees booking summary + price on page → `is_irreversible=True` | → SSE `paused` event sent to user with transaction details |
 | 9 | User confirms via `/confirm/abc123` | Human-in-the-loop | Execution resumes |
 | 10 | `extract_text("booking confirmation")` | Verify outcome from page state | Returns booking ID + confirmation message |
 | 11 | `finish()` | Goal complete — confirmation ID extracted | `outcome: "success", booking_id: "OLA-84921"` |
@@ -498,7 +498,7 @@ Script crashes. Engineer gets paged at 2am. Script is manually patched. Repeat n
 | **Token budget exceeded** | `tokens_used > 15,000` | Force `END`, return what's collected so far | Open-ended tasks that legitimately need more tokens — those should be broken into sub-tasks |
 | **Site uses CAPTCHA** | Body text contains "CAPTCHA"/"verify" | LLM notes it in final_answer | Auto-solving CAPTCHAs (out of scope, ethically questionable) |
 | **Site blocks bot fingerprint** | `navigate_to` returns error page | LLM notes it; try alternative URL | Full stealth mode (out of scope for this system) |
-| **Dangerous click (payment)** | Regex match on click description | Human confirmation via SSE pause | Autonomous payment without human approval |
+| **Dangerous click (payment)** | `ActionRisk` LLM classifier flags `is_irreversible=True` based on page context | Human confirmation via SSE pause; approval bound to specific transaction details | Autonomous payment without human approval |
 
 **Key trade-off:** Semantic locators try 4–5 strategies per action, so they're slower than a single CSS selector. For a real-time system that's a concern — but HULP's automation runs async in the background, so a 200ms locator resolution is totally fine.
 
@@ -675,7 +675,7 @@ def compute_risk_score(session: SessionSignals) -> int:
 
 These thresholds are starting points — they're set conservatively to minimize false positives. In practice they'd be calibrated against real traffic distributions.
 
-**Important: these are probabilistic signals, not proof.** A keyboard-only user generates zero mouse events (entropy = 0) and would score +20 — a false positive. A user with a password manager auto-filling may have low click latency. Assistive technology users behave differently from both typical humans and bots. None of these signals alone is proof of automation.
+**Important: these are probabilistic signals, not proof.** A keyboard-only user generates zero mouse events — `computeMouseEntropy()` returns `null` (fewer than 3 points), so the signal is skipped and contributes 0 to score, not +20. A user with a password manager auto-filling may have low click latency. Assistive technology users behave differently from both typical humans and bots. None of these signals alone is proof of automation.
 
 This is why the tiered response matters: **no single signal triggers a block.** To reach score 80+ (block), a session needs to trip multiple independent signals — e.g. zero mouse entropy AND a known bot JA3 AND datacenter IP. A keyboard-only user on a residential connection with a real browser JA3 scores at most 20-30 (allow or soft friction). Hard restrictions only fire when several unrelated signals converge. Thresholds must be calibrated against real HULP traffic before deployment — what looks like a bot threshold in theory may cut into real user segments in practice.
 
@@ -830,7 +830,8 @@ class TelemetryCollector {
             : null;  // null = no click recorded yet
 
         navigator.sendBeacon('/api/telemetry', JSON.stringify({
-            sessionId: this.sessionId,
+            // sessionId is NOT sent in the body — the server reads it from the HttpOnly cookie.
+            // Sending it here would allow a client to target any session key.
             mouseEntropy: this.computeMouseEntropy(),   // null if < 3 mouse points
             clickLatency,                               // null if no click recorded
             keystrokeUniformity                         // null if < 2 key intervals
@@ -840,7 +841,6 @@ class TelemetryCollector {
 ```
 
 > **Note on null signals and scoring:** When a signal arrives as `null`, the scoring engine skips that signal rather than treating it as a specific value. A bot using `page.fill()` bypasses `keydown` events entirely — `keystrokeUniformity` arrives as `null` and contributes 0 points, not +10. This is conservative: missing behavioral signals don't inflate the score. The network and temporal signals (JA3, IP, time-on-page) still fire independently and catch the bot through other dimensions.
-```
 
 **Redis session state:**
 
