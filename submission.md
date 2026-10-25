@@ -475,7 +475,13 @@ Script crashes. Engineer gets paged at 2am. Script is manually patched. Repeat n
 - Horizontal scaling: multiple worker pods, each running N concurrent browser contexts
 - Browser contexts are far cheaper than full browser instances (shared process)
 - **Memory limit per pod:** Each browser context uses ~50–150MB RAM. A pod with 8GB RAM can safely run ~40–60 concurrent contexts. Beyond that, spin up another pod.
-- **Playwright crash recovery:** If a browser context crashes mid-run, the `AgentState` is already persisted in memory (and optionally Redis for distributed setups). The run can be retried from the last successful step rather than from scratch — partial progress is not lost.
+- **Crash recovery — durable checkpoints (not in-memory):** After every step completes successfully, the result is written to a durable store (Redis or Postgres) before moving to the next step:
+  ```python
+  await checkpoint_store.save(run_id=run.id, step_idx=step.idx, result=result)
+  ```
+  In-memory state alone cannot survive a worker crash — durability requires explicit persistence. On restart, the worker reads the last saved checkpoint and resumes from there.
+- **Worker leases:** Each worker holds a heartbeat lock on its assigned run (renewed every 10s). If a worker crashes and the heartbeat expires, a supervisor reassigns the run to a healthy worker, which resumes from the last checkpoint.
+- **Idempotency before resume:** Before replaying any step from a checkpoint, the worker checks whether the action already produced its side effect — especially for irreversible steps (booking, payment). If a booking already exists for this `run_id`, the step is marked complete without re-executing. This connects directly to the `UNKNOWN_OUTCOME` handling in section 2.4.
 
 ### Cost
 
