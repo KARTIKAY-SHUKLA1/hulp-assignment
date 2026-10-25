@@ -747,11 +747,15 @@ class TelemetryCollector {
 
     beacon() {
         const timings = this.signals.keyTimings;
-        const intervals = timings.slice(1).map((t, i) => t - timings[i]);
-        // Return null when signal is unavailable — don't compute from missing data
-        const keystrokeUniformity = intervals.length > 1
-            ? 1 - (stddev(intervals) / mean(intervals))
-            : null;  // null = signal unavailable (e.g. page.fill() bypasses keydown events)
+        const intervals = timings.slice(1).map((t, i) => t - timings[i])
+            .filter(interval => interval > 0);  // drop zero/negative intervals (clock skew or synthetic simultaneity)
+
+        // Guard: need at least 2 valid intervals AND a positive mean before computing.
+        // mean = 0 would cause division by zero → NaN, which bypasses the null check in the scorer.
+        const meanInterval = intervals.length >= 2 ? mean(intervals) : 0;
+        const keystrokeUniformity = (intervals.length >= 2 && meanInterval > 0)
+            ? 1 - (stddev(intervals) / meanInterval)
+            : null;  // null = signal unavailable (e.g. page.fill() bypasses keydown, or too few events)
 
         const firstClick = this.signals.clickTimings[0];
         const clickLatency = firstClick !== undefined
