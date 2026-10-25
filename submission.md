@@ -865,7 +865,10 @@ app.post('/api/telemetry', async (req, res) => {
     // never from req.body. If sessionId came from the body, a bot could write a
     // fabricated low-risk score into any session key it chooses, including its own.
     const sessionId = req.cookies.sessionId;
-    if (!sessionId) return res.status(400).json({ error: 'No session' });
+    // Validate against server-side session records — existence of the cookie alone is not enough.
+    // A forged cookie with an arbitrary string would pass a simple null check.
+    const session = await getSession(sessionId);
+    if (!session) return res.status(401).json({ error: 'Invalid session' });
 
     // Behavioral signals come from the client — treat as untrusted evidence, not proof.
     // A bot can send { mouseEntropy: 0.73, clickLatency: 1240 } to appear human.
@@ -902,7 +905,10 @@ app.post('/api/bookings', async (req, res) => {
     // A client-supplied risk score would be trivially spoofable; only the server-side
     // Redis value (written by the telemetry endpoint) is trusted.
     const sessionId = req.cookies.sessionId;
-    if (!sessionId) return res.status(401).json({ error: 'No session' });
+    // Validate against server-side session records — a forged cookie passes a null check
+    // but fails here if it doesn't correspond to a real session.
+    const session = await getSession(sessionId);
+    if (!session) return res.status(401).json({ error: 'Invalid session' });
 
     // Retrieve the score the telemetry endpoint computed and stored.
     // If the beacon never arrived (ad blocker, no JS), score is null — fall back to
