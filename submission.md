@@ -715,7 +715,7 @@ class TelemetryCollector {
     constructor(sessionId) {
         this.sessionId = sessionId;
         this.signals = { mousePoints: [], clickTimings: [], keyTimings: [] };
-        this.pageLoadTime = performance.timing.navigationStart;
+        this.pageLoadTime = performance.timeOrigin;  // performance.timing.navigationStart is deprecated; timeOrigin is the modern equivalent
         this._attachListeners();
     }
 
