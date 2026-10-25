@@ -495,6 +495,8 @@ Script crashes. Engineer gets paged at 2am. Script is manually patched. Repeat n
 
 ### Cost
 
+> **These are design-target estimates derived from public pricing and Playwright benchmarks, not production measurements. Actual figures depend on task complexity, token usage per run, and infrastructure configuration. Validate against real traffic before sizing capacity.**
+
 Cost scales linearly with run volume and task complexity:
 
 - **~\$0.001/run** at Gemini Flash 2.0 pricing (\$0.075/M input tokens, ~5,000–8,000 tokens per 10-step run) — significantly cheaper than alternatives
@@ -881,6 +883,9 @@ The request receives `429` with a generic error. The attacker doesn't know if th
 - **JA3 extraction:** Done at the nginx layer via `nginx-ja3` module — zero app-layer overhead.
 
 ### Cost
+
+> **These are design-target estimates based on public pricing pages, not measured production costs. Actual spend depends on cache hit rate, session length, and traffic distribution. Treat as planning inputs; benchmark against real HULP traffic before committing.**
+
 - **Redis:** ~\$50/month for a managed 1GB cluster at 100K sessions
 - **IP reputation API:** ~\$0.001/lookup → ~\$30/day at 30K sessions/day
 - **Optimization:** Cache IP reputation lookups in Redis for 1 hour — same IP isn't re-checked on every request
