@@ -860,23 +860,37 @@ SADD ja3_blocklist "b32309a26951912be7dba376398abc3b"
 
 ```javascript
 app.post('/api/telemetry', async (req, res) => {
-    const { sessionId, mouseEntropy, clickLatency, keystrokeUniformity } = req.body;
+    // Session ID must come from the same server-set HttpOnly cookie used by checkout —
+    // never from req.body. If sessionId came from the body, a bot could write a
+    // fabricated low-risk score into any session key it chooses, including its own.
+    const sessionId = req.cookies.sessionId;
+    if (!sessionId) return res.status(400).json({ error: 'No session' });
 
+    // Behavioral signals come from the client — treat as untrusted evidence, not proof.
+    // A bot can send { mouseEntropy: 0.73, clickLatency: 1240 } to appear human.
+    // These signals influence the score but cannot override the server-side anchors below.
+    const { mouseEntropy, clickLatency, keystrokeUniformity } = req.body;
+
+    // Server-side signals — not supplied by the client, cannot be fabricated via req.body.
+    // JA3 is extracted by nginx from the TLS handshake; IP is from the network layer.
+    // Even if a bot sends perfect behavioral signals, these still fire independently.
     const ja3 = extractJA3FromRequest(req);     // from nginx-ja3 module header
     const ip = req.ip;
-    const isDatacenterIP = await checkIPReputation(ip);     // against known ASN list
+    const isDatacenterIP = await checkIPReputation(ip);
     const isKnownBotJA3 = await redis.sismember('ja3_blocklist', ja3);
     const ordersThisHour = parseInt(await redis.get(`ip:${ip}:orders:1h`) || '0');
 
     const score = computeRiskScore({
-        mouseEntropy, clickLatency, keystrokeUniformity,
-        isDatacenterIP, isKnownBotJA3, ordersThisHour
+        mouseEntropy, clickLatency, keystrokeUniformity,  // client-supplied, untrusted
+        isDatacenterIP, isKnownBotJA3, ordersThisHour    // server-side, authoritative
     });
 
     await redis.set(`session:${sessionId}:score`, score, 'EX', 1800);
     res.json({ ok: true });
 });
 ```
+
+> **Trust boundary:** Behavioral signals (mouse, keyboard, click timing) are client-supplied and can be fabricated. A bot sending `mouseEntropy: 0.73` would score 0 on behavioral signals — but JA3 and IP are extracted server-side from the network layer and cannot be spoofed via the request body. A Playwright bot with a datacenter IP still scores +40 from those two signals alone, regardless of what behavioral values it sends. Rate limits on `ip:{ip}:orders:1h` are also server-side and unaffected by telemetry manipulation. Client-side signals add evidence; server-side signals provide the floor the score cannot drop below.
 
 **Checkout enforcement endpoint:**
 
