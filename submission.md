@@ -604,17 +604,26 @@ def compute_risk_score(session: SessionSignals) -> int:
     score = 0
 
     # Behavioral signals (max 40 points)
-    if session.mouse_entropy < 0.1:           score += 20  # too linear / absent
-    if session.click_latency_ms < 100:        score += 10  # inhuman speed
-    if session.keystroke_uniformity > 0.95:   score += 10  # programmatic fill
+    # Each may be None if telemetry was blocked or the beacon never arrived.
+    # Skip missing signals — unknown is not the same as suspicious.
+    if session.mouse_entropy is not None and session.mouse_entropy < 0.1:
+        score += 20  # too linear / absent
+    if session.click_latency_ms is not None and session.click_latency_ms < 100:
+        score += 10  # inhuman speed
+    if session.keystroke_uniformity is not None and session.keystroke_uniformity > 0.95:
+        score += 10  # programmatic fill (page.type() style)
 
     # Network signals (max 40 points)
+    # Server-side booleans — always available, default False when lookup fails.
     if session.ip_in_datacenter_range:        score += 20
     if session.ja3_matches_known_bot:         score += 20
 
     # Temporal signals (max 20 points)
-    if session.time_on_page_sec < 2:          score += 10
-    if session.orders_per_hour > 5:           score += 10
+    # time_on_page comes from the telemetry beacon — may be None if beacon was blocked.
+    if session.time_on_page_sec is not None and session.time_on_page_sec < 2:
+        score += 10
+    if session.orders_per_hour is not None and session.orders_per_hour > 5:
+        score += 10
 
     return min(score, 100)
 ```
