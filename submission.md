@@ -669,7 +669,7 @@ def compute_risk_score(session: SessionSignals) -> int:
 ```
 
 **Why these thresholds specifically?**
-- `mouse_entropy < 0.1` — Playwright generates **zero** real mouse events on a synthetic click. Entropy literally = 0. The 0.1 threshold is generous to catch even bots that inject minimal fake movement.
+- `mouse_entropy < 0.1` — Playwright generates **zero** real mouse events on a synthetic click. The collector requires at least 3 mouse points to compute entropy — with zero events, `computeMouseEntropy()` returns `null` and the signal is skipped (score contribution = 0). The threshold exists for bots that inject minimal synthetic movement (≥ 3 points but perfectly linear) — those produce an entropy value near 0, which the 0.1 threshold catches.
 - `click_latency < 100ms` — Human reaction time (stimulus → click) is minimum ~150ms, well-established in HCI research. Anything under 100ms is physically impossible for a human.
 - `keystroke_uniformity > 0.95` — `page.fill()` bypasses keydown/keyup events entirely, so `keystroke_uniformity` comes back `null` for that bot and the check is skipped (score contribution = 0). The threshold exists for bots that use `page.type()` instead, which does fire keydown events but with 0ms inter-key delay (uniformity → 1.0). Real humans have uniformity ~0.3–0.6 depending on typing speed. 0.95 catches `page.type()`-style programmatic fills while ignoring fast typists.
 
@@ -873,17 +873,17 @@ app.post('/api/telemetry', async (req, res) => {
 
 | Check | Signal Value | Score Contribution |
 |---|---|---|
-| Mouse entropy | 0.0 (no mouse events) | +20 |
+| Mouse entropy | `null` — Playwright generates no mouse events; fewer than 3 points recorded, collector returns null | +0 |
 | Click latency | 48ms (sub-human) | +10 |
 | Keystroke uniformity | `null` — `page.fill()` bypasses keydown events entirely; no inter-key intervals recorded | +0 |
 | IP reputation | AWS us-east-1 egress | +20 |
 | JA3 hash | Matches known Playwright fingerprint | +20 |
 | Time on page | 0.3 seconds | +10 |
-| **Total** | | **80 → BLOCK** |
+| **Total** | | **60 → Hard Friction (OTP)** |
 
-The request receives `429` with a generic error. The attacker doesn't know if they were rate-limited or if there's a real server issue. The session is logged for IP-level blocking.
+The session hits the OTP tier. The attacker has no access to the OTP inbox — blocked. The request does not receive an outright `429`; it instead hits the OTP wall, which gives the attacker no information about whether they were detected or just need to verify.
 
-**Edge case within this example:** What if the attacker switches to a residential proxy? The IP reputation check (+20) is now missed. Score drops from 80 to 60 — still in the **Hard Friction** zone. They now hit the OTP step. Since they have no access to the OTP inbox, they're effectively blocked regardless. The behavioral and JA3 signals do the heavy lifting even without the IP signal.
+**Edge case within this example:** What if the attacker switches to a residential proxy? The IP reputation check (+20) is now missed. Score drops from 60 to 40 — into the **Soft Friction** zone (artificial delay + rate limit). Combined with JA3 flagging and the OTP tier they're approaching, bulk abuse becomes operationally difficult. The JA3 signal still fires independently of IP, so the attacker needs to also patch their TLS fingerprint to meaningfully evade.
 
 ---
 
@@ -947,14 +947,14 @@ Honestly — **yes, mostly.** And that's by design.
 
 | Part 2 Defense | BrowserBot's Fate | Why |
 |---|---|---|
-| **Mouse entropy check** | ❌ CAUGHT | Playwright's synthetic click generates no real mouse movement events. Entropy = 0. |
+| **Mouse entropy check** | ✅ SURVIVES (this check) | Playwright generates no mouse events, so `mousePoints.length < 3` — `computeMouseEntropy()` returns `null`. The null guard in the scorer skips this signal (+0). BrowserBot is still caught by click latency, JA3, and time-on-page — just not by mouse entropy directly. |
 | **Click latency check** | ❌ CAUGHT | Programmatic clicks fire in 30–80ms — well below the 100ms human threshold. |
 | **JA3 fingerprint** | ❌ CAUGHT | Playwright Chromium has a distinct JA3 hash. Even though BrowserBot sets a realistic user-agent in `browser.py`, the JA3 betrays the automation layer. This is likely one reason Amazon blocks BrowserBot — I noted it in my README — though Amazon's detection stack is a black box and JA3 may be one of several signals. The UA string lies; the TLS handshake doesn't. |
-| **Keystroke uniformity** | ✅ SURVIVES (this check) | `page.fill()` bypasses keydown events entirely — `keystroke_uniformity` is `null`, so this signal contributes 0. BrowserBot is still caught by mouse entropy, click latency, and JA3 — just not by this one. |
+| **Keystroke uniformity** | ✅ SURVIVES (this check) | `page.fill()` bypasses keydown events entirely — `keystroke_uniformity` is `null`, so this signal contributes 0. BrowserBot is still caught by click latency, JA3, and time-on-page — just not by this one. |
 | **Honeypot fields** | ✅ SURVIVES | BrowserBot uses semantic locators (`get_by_placeholder`, `get_by_label`). It targets fields by visible description, not by filling every DOM element. A `display:none` honeypot would never be targeted. |
 | **OTP hard friction** | ❌ CAUGHT | BrowserBot has no inbox access. It cannot retrieve or enter an OTP. Blocked. |
 
-**Conclusion:** A BrowserBot-style automation scores **60–80** from behavioral and JA3 signals alone. The reliable signals: mouse entropy +20, click latency +10, time on page +10, JA3 +20 = **60 minimum** (keystroke uniformity contributes 0 because `page.fill()` bypasses keydown events — the signal is null). If it also runs from a cloud/datacenter IP — which is common for server-deployed automation — the IP reputation check adds another +20, pushing the score to **80 → hard block**. Even at the lower score of 60, it hits the OTP tier and gets blocked there.
+**Conclusion:** A BrowserBot-style automation scores **40–60** from behavioral and JA3 signals. Mouse entropy is `null` (fewer than 3 mouse points — the collector returns null, the scorer skips it). The reliable signals: click latency +10, time on page +10, JA3 +20 = **40 minimum**. If it also runs from a cloud/datacenter IP — which is common for server-deployed automation — the IP reputation check adds another +20, pushing the score to **60 → Hard Friction (OTP)**. At 60 it hits the OTP tier and gets blocked there — the attacker has no inbox access.
 
 A determined attacker could invest in evading individual signals, but each layer they bypass requires additional infrastructure and expertise. The defense doesn't need to be unbeatable — it needs to make bulk abuse economically unviable compared to legitimate alternatives.
 
