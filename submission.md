@@ -5,17 +5,11 @@
 
 ## Preface
 
-Before diving in — I've already built something very close to what this assignment is asking about, and it's on my resume.
+Before diving in — I built something directly relevant before this assignment: **[BrowserBot](https://github.com/KARTIKAY-SHUKLA1/BrowserBot)**, an autonomous AI browser agent (LangGraph, Playwright, Llama-3.3-70b) that navigates real websites from a natural-language goal with no public API. It's on my resume.
 
-**[BrowserBot](https://github.com/KARTIKAY-SHUKLA1/BrowserBot)** is a project I built independently before this assignment — an autonomous AI browser agent using LangGraph, Playwright, and Llama-3.3-70b (via Groq). It takes a natural-language goal — like *"go to Flipkart and return the top 3 wireless mouse products with prices"* — and autonomously navigates real websites to accomplish it, with no public API involved. It handles multi-step flows, retries failed actions, streams live progress via SSE, and pauses for human confirmation before any payment-related click.
+It gave me hands-on experience on both sides of this problem. For Part 1 — I had to make it resilient to real websites; Flipkart works reliably, Amazon blocks it, and I know exactly why. For Part 2 — because I built a bot, I know firsthand what signals betray automation. That's not something I read about.
 
-When I got this assignment, I realized I'd already been solving both problems in practice:
-- **Part 1** — BrowserBot is exactly this problem. I had to make it resilient to real websites. Flipkart works reliably; Amazon blocks it — and I know exactly why.
-- **Part 2** — Because I built a bot, I know firsthand what signals betray automation. That's not something I read about — I experienced it while building.
-
-Everything in this submission comes from that hands-on experience. Where BrowserBot does something one way and a production system would do it better, I'll say so explicitly.
-
-I'll use **online service booking** (cab booking, home services) as the domain throughout — which is directly what HULP does.
+I'll use **online service booking** (cab booking, home services) as the domain throughout — directly what HULP does.
 
 ---
 
