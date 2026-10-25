@@ -585,6 +585,10 @@ def compute_risk_score(session: SessionSignals) -> int:
 
 These thresholds are starting points — they're set conservatively to minimize false positives. In practice they'd be calibrated against real traffic distributions.
 
+**Important: these are probabilistic signals, not proof.** A keyboard-only user generates zero mouse events (entropy = 0) and would score +20 — a false positive. A user with a password manager auto-filling may have low click latency. Assistive technology users behave differently from both typical humans and bots. None of these signals alone is proof of automation.
+
+This is why the tiered response matters: **no single signal triggers a block.** To reach score 80+ (block), a session needs to trip multiple independent signals — e.g. zero mouse entropy AND a known bot JA3 AND datacenter IP. A keyboard-only user on a residential connection with a real browser JA3 scores at most 20-30 (allow or soft friction). Hard restrictions only fire when several unrelated signals converge. Thresholds must be calibrated against real HULP traffic before deployment — what looks like a bot threshold in theory may cut into real user segments in practice.
+
 This is deterministic and auditable — when a legitimate user gets wrongly blocked, the support team can pull their session, see exactly which signals fired and why, and reset their score manually. A black-box ML model can't offer that transparency. Auditability is the main reason to start with rules rather than ML — the deterministic v1 system also generates clean training labels for the v2 model.
 
 **v2 upgrade path — ML scoring:**
