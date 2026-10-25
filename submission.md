@@ -791,9 +791,12 @@ class TelemetryCollector {
         const N_BINS = 16;
         const bins = new Array(N_BINS).fill(0);
         for (const angle of angles) {
-            // Map [-π, π] → [0, N_BINS)
+            // Wrap to [-π, π] before binning.
+            // The raw difference of two atan2 values spans [-2π, 2π]; values outside
+            // [-π, π] would map to invalid or clamped bin indices without this step.
+            const wrapped = Math.atan2(Math.sin(angle), Math.cos(angle));
             const idx = Math.min(
-                Math.floor(((angle + Math.PI) / (2 * Math.PI)) * N_BINS),
+                Math.floor(((wrapped + Math.PI) / (2 * Math.PI)) * N_BINS),
                 N_BINS - 1
             );
             bins[idx]++;
