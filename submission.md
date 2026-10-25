@@ -396,8 +396,10 @@ START ──▶ plan ──▶ act ──▶ observe ──▶ [conditional] ─
 // Agent paused for confirmation
 {"type": "paused", "run_id": "abc123", "pending_action": {...}, "message": "Agent wants to click 'Confirm Payment'..."}
 
-// Run complete
-{"type": "done", "result": {"goal": "...", "steps_taken": [...], "final_answer": "...", "success": true}}
+// Run complete — outcome field distinguishes verified success from mere task completion
+// Possible outcome values: "success" (confirmed from page state), "failed" (error confirmed),
+// "incomplete" (task stopped mid-way), "unknown" (action executed but result unverifiable)
+{"type": "done", "result": {"goal": "...", "steps_taken": [...], "final_answer": "...", "outcome": "success", "booking_id": "OLA-84921"}}
 ```
 
 ---
@@ -419,9 +421,12 @@ START ──▶ plan ──▶ act ──▶ observe ──▶ [conditional] ─
 | 7 | `click_element("Book Mini")` | Select cab type | Clicked |
 | 8 | ⚠️ **Safety gate** on `click_element("Confirm Booking")` | Matches `confirm\s+order` regex | → SSE `paused` event sent to user |
 | 9 | User confirms via `/confirm/abc123` | Human-in-the-loop | Execution resumes |
-| 10 | `finish()` | Goal complete | `success: true` |
+| 10 | `extract_text("booking confirmation")` | Verify outcome from page state | Returns booking ID + confirmation message |
+| 11 | `finish()` | Goal complete — confirmation ID extracted | `outcome: "success", booking_id: "OLA-84921"` |
 
-**Result:** Booking completed. Human approved the final confirmation step.
+**Result:** Booking confirmed. Outcome verified from page state (booking ID present), not inferred from reaching `finish()`.
+
+> **Why this matters:** `finish()` means the LLM decided the task is done — it doesn't mean the booking exists. The verification step (`extract_text`) reads the actual page state after the action. If the confirmation page never loaded, or returned an error, the LLM would see that in the snapshot and set `outcome: "unknown"` or `outcome: "failed"` instead.
 
 ---
 
@@ -445,7 +450,8 @@ Script crashes. Engineer gets paged at 2am. Script is manually patched. Repeat n
 | 4 | `click_element("Reserve Instantly")` | ✅ Clicked — booking flow resumes |
 | 5 | `extract_text("page")` | Cab options and ETAs loaded |
 | 6 | `click_element("Book Mini")` | ✅ Clicked |
-| 7 | `finish()` | `success: true` |
+| 7 | `extract_text("booking confirmation")` | Verify outcome — did the click actually complete the booking? |
+| 8 | `finish()` | Confirmation text found — `outcome: "success"` |
 
 **Why this works:** The observe node fed back the full page body text including `"Reserve Instantly"` as a visible element. The LLM's next plan naturally adapted. No code change required.
 
@@ -470,7 +476,7 @@ Script crashes. Engineer gets paged at 2am. Script is manually patched. Repeat n
 
 ### Monitoring
 - **Step success rate per run:** what % of steps succeed on first attempt vs. retry
-- **Run completion rate:** % of runs that reach `success: true`
+- **Run completion rate:** % of runs that reach `outcome: "success"` (confirmed from page state) vs. `"failed"`, `"incomplete"`, or `"unknown"` — the breakdown matters more than the aggregate
 - **LLM JSON parse failure rate:** tracks prompt quality degradation
 - **P95 step latency:** alert if semantic locator resolution gets slow
 
