@@ -303,6 +303,31 @@ The action is intercepted. Instead of executing:
 
 The whole point is: you never auto-pay on someone's behalf without them explicitly saying yes.
 
+**Limitation of this approach — and the production fix:**
+
+The regex matches against the **LLM's text description** of the action, not the actual element on the page. This is a weak security boundary — a site labelling its payment button "Proceed", "Go!", or "Next →" would bypass the regex entirely. The LLM might also describe the action loosely ("click the green button") and miss the match.
+
+The production fix is to enforce the gate at the **execution layer**, after the element is resolved but before it's clicked:
+
+```python
+async def should_require_approval(element, page) -> bool:
+    element_text = (await element.inner_text()).lower()
+    element_type = await element.get_attribute("type")
+    page_context = (page.url + await page.title()).lower()
+
+    is_submit_button = element_type == "submit"
+    is_payment_page = any(kw in page_context for kw in
+                          ["checkout", "payment", "confirm", "booking", "pay"])
+    has_payment_text = any(kw in element_text for kw in
+                           ["proceed", "confirm", "pay", "book", "order"])
+
+    # Gate fires when element is a submit button on a payment-context page
+    # regardless of what the LLM described it as
+    return is_submit_button and (is_payment_page or has_payment_text)
+```
+
+This catches "Proceed", "Go!", "Next →" on a checkout page that the regex would miss — because it checks what's actually on the page, not what the LLM wrote.
+
 ---
 
 ## 3. Implementation Details
