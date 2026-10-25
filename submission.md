@@ -684,7 +684,7 @@ This is one of the strongest signals. When a browser opens an HTTPS connection, 
 Real Chrome browser → JA3: `ada70210d4b8e024bcce` (example)  
 Playwright Chromium → JA3: `b32309a26951912be7dba376398abc3b` (different, even with same UA string)
 
-This is why my BrowserBot README notes: *"Amazon aggressively blocks headful Playwright instances even with a real user agent."* Amazon uses exactly this technique — the JA3 hash betrays the Playwright context even though the user-agent string says "Chrome." I set a realistic user-agent in BrowserBot's `browser.py`, but that doesn't change the TLS handshake.
+This is why my BrowserBot README notes: *"Amazon aggressively blocks headful Playwright instances even with a real user agent."* One likely explanation is JA3 fingerprinting — the TLS handshake from Playwright Chromium differs from a real Chrome browser even when the user-agent string is identical. I set a realistic user-agent in BrowserBot's `browser.py`, but that doesn't change the TLS handshake. Amazon's actual detection stack is a black box, so I can't confirm JA3 is the sole cause — it could also involve canvas fingerprinting, cipher suite ordering, or other heuristics — but JA3 mismatch is the most plausible and commonly cited reason.
 
 ### 2.5 Honeypot Fields
 
@@ -904,7 +904,7 @@ Honestly — **yes, mostly.** And that's by design.
 |---|---|---|
 | **Mouse entropy check** | ❌ CAUGHT | Playwright's synthetic click generates no real mouse movement events. Entropy = 0. |
 | **Click latency check** | ❌ CAUGHT | Programmatic clicks fire in 30–80ms — well below the 100ms human threshold. |
-| **JA3 fingerprint** | ❌ CAUGHT | Playwright Chromium has a distinct JA3 hash. Even though BrowserBot sets a realistic user-agent in `browser.py`, the JA3 betrays the automation layer. This is exactly why Amazon blocks BrowserBot — I noted it in my README. The UA string lies; the TLS handshake doesn't. |
+| **JA3 fingerprint** | ❌ CAUGHT | Playwright Chromium has a distinct JA3 hash. Even though BrowserBot sets a realistic user-agent in `browser.py`, the JA3 betrays the automation layer. This is likely one reason Amazon blocks BrowserBot — I noted it in my README — though Amazon's detection stack is a black box and JA3 may be one of several signals. The UA string lies; the TLS handshake doesn't. |
 | **Keystroke uniformity** | ✅ SURVIVES (this check) | `page.fill()` bypasses keydown events entirely — `keystroke_uniformity` is `null`, so this signal contributes 0. BrowserBot is still caught by mouse entropy, click latency, and JA3 — just not by this one. |
 | **Honeypot fields** | ✅ SURVIVES | BrowserBot uses semantic locators (`get_by_placeholder`, `get_by_label`). It targets fields by visible description, not by filling every DOM element. A `display:none` honeypot would never be targeted. |
 | **OTP hard friction** | ❌ CAUGHT | BrowserBot has no inbox access. It cannot retrieve or enter an OTP. Blocked. |
