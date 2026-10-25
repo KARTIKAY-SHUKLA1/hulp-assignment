@@ -669,7 +669,7 @@ def compute_risk_score(session: SessionSignals) -> int:
 ```
 
 **Why these thresholds specifically?**
-- `mouse_entropy < 0.1` — Playwright generates **zero** real mouse events on a synthetic click. The collector requires at least 3 mouse points to compute entropy — with zero events, `computeMouseEntropy()` returns `null` and the signal is skipped (score contribution = 0). The threshold exists for bots that inject minimal synthetic movement (≥ 3 points but perfectly linear) — those produce an entropy value near 0, which the 0.1 threshold catches.
+- `mouse_entropy < 0.1` — Playwright generates **zero** real mouse events on a synthetic click. The collector requires at least 3 mouse points to compute entropy — with zero events, `computeMouseEntropy()` returns `null` and the signal is skipped (score contribution = 0). The threshold exists for bots that inject minimal synthetic movement (≥ 3 points but perfectly linear): angles are discretized into 16 bins spanning `[-π, π]` and entropy is normalized by `log2(16)` to `[0, 1]`. A perfectly linear path puts all angles in one bin → entropy = 0. A human's natural curved movement spreads angles across many bins → entropy near 1. The 0.1 threshold catches near-linear synthetic paths while leaving human movement untouched.
 - `click_latency < 100ms` — Human reaction time (stimulus → click) is minimum ~150ms, well-established in HCI research. Anything under 100ms is physically impossible for a human.
 - `keystroke_uniformity > 0.95` — `page.fill()` bypasses keydown/keyup events entirely, so `keystroke_uniformity` comes back `null` for that bot and the check is skipped (score contribution = 0). The threshold exists for bots that use `page.type()` instead, which does fire keydown events but with 0ms inter-key delay (uniformity → 1.0). Real humans have uniformity ~0.3–0.6 depending on typing speed. 0.95 catches `page.type()`-style programmatic fills while ignoring fast typists.
 
@@ -782,7 +782,31 @@ class TelemetryCollector {
             const dy2 = this.signals.mousePoints[i].y - this.signals.mousePoints[i-1].y;
             angles.push(Math.atan2(dy2, dx2) - Math.atan2(dy1, dx1));
         }
-        return shannonEntropy(angles);  // 0 = perfectly linear, 1 = chaotic/human
+
+        // Shannon entropy requires a discrete distribution.
+        // Discretize angles into N_BINS equal buckets spanning [-π, π],
+        // then normalize entropy by log2(N_BINS) to get a value in [0, 1].
+        // 0 = all angles in the same bucket (perfectly linear movement).
+        // 1 = angles spread uniformly across all buckets (chaotic/human movement).
+        const N_BINS = 16;
+        const bins = new Array(N_BINS).fill(0);
+        for (const angle of angles) {
+            // Map [-π, π] → [0, N_BINS)
+            const idx = Math.min(
+                Math.floor(((angle + Math.PI) / (2 * Math.PI)) * N_BINS),
+                N_BINS - 1
+            );
+            bins[idx]++;
+        }
+        const total = angles.length;
+        let entropy = 0;
+        for (const count of bins) {
+            if (count > 0) {
+                const p = count / total;
+                entropy -= p * Math.log2(p);
+            }
+        }
+        return entropy / Math.log2(N_BINS);  // normalized to [0, 1]
     }
 
     beacon() {
