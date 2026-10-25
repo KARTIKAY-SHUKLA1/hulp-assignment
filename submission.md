@@ -622,7 +622,7 @@ def compute_risk_score(session: SessionSignals) -> int:
 **Why these thresholds specifically?**
 - `mouse_entropy < 0.1` — Playwright generates **zero** real mouse events on a synthetic click. Entropy literally = 0. The 0.1 threshold is generous to catch even bots that inject minimal fake movement.
 - `click_latency < 100ms` — Human reaction time (stimulus → click) is minimum ~150ms, well-established in HCI research. Anything under 100ms is physically impossible for a human.
-- `keystroke_uniformity > 0.95` — `page.fill()` types all characters atomically with 0ms inter-key delay (uniformity = 1.0). Real humans have uniformity ~0.3–0.6 depending on typing speed. 0.95 catches programmatic fills while ignoring fast typists.
+- `keystroke_uniformity > 0.95` — `page.fill()` bypasses keydown/keyup events entirely, so `keystroke_uniformity` comes back `null` for that bot and the check is skipped (score contribution = 0). The threshold exists for bots that use `page.type()` instead, which does fire keydown events but with 0ms inter-key delay (uniformity → 1.0). Real humans have uniformity ~0.3–0.6 depending on typing speed. 0.95 catches `page.type()`-style programmatic fills while ignoring fast typists.
 
 These thresholds are starting points — they're set conservatively to minimize false positives. In practice they'd be calibrated against real traffic distributions.
 
@@ -820,15 +820,15 @@ app.post('/api/telemetry', async (req, res) => {
 |---|---|---|
 | Mouse entropy | 0.0 (no mouse events) | +20 |
 | Click latency | 48ms (sub-human) | +10 |
-| Keystroke uniformity | 0.99 (programmatic `page.fill()`) | +10 |
+| Keystroke uniformity | `null` — `page.fill()` bypasses keydown events entirely; no inter-key intervals recorded | +0 |
 | IP reputation | AWS us-east-1 egress | +20 |
 | JA3 hash | Matches known Playwright fingerprint | +20 |
 | Time on page | 0.3 seconds | +10 |
-| **Total** | | **90 → BLOCK** |
+| **Total** | | **80 → BLOCK** |
 
 The request receives `429` with a generic error. The attacker doesn't know if they were rate-limited or if there's a real server issue. The session is logged for IP-level blocking.
 
-**Edge case within this example:** What if the attacker switches to a residential proxy? The IP reputation check (+20) is now missed. Score drops to 70 — still in the **Hard Friction** zone. They now hit the OTP step. Since they have no access to the OTP inbox, they're effectively blocked regardless. The behavioral and JA3 signals do the heavy lifting even without the IP signal.
+**Edge case within this example:** What if the attacker switches to a residential proxy? The IP reputation check (+20) is now missed. Score drops from 80 to 60 — still in the **Hard Friction** zone. They now hit the OTP step. Since they have no access to the OTP inbox, they're effectively blocked regardless. The behavioral and JA3 signals do the heavy lifting even without the IP signal.
 
 ---
 
@@ -885,11 +885,11 @@ Honestly — **yes, mostly.** And that's by design.
 | **Mouse entropy check** | ❌ CAUGHT | Playwright's synthetic click generates no real mouse movement events. Entropy = 0. |
 | **Click latency check** | ❌ CAUGHT | Programmatic clicks fire in 30–80ms — well below the 100ms human threshold. |
 | **JA3 fingerprint** | ❌ CAUGHT | Playwright Chromium has a distinct JA3 hash. Even though BrowserBot sets a realistic user-agent in `browser.py`, the JA3 betrays the automation layer. This is exactly why Amazon blocks BrowserBot — I noted it in my README. The UA string lies; the TLS handshake doesn't. |
-| **Keystroke uniformity** | ❌ CAUGHT | `page.fill()` types all text atomically — no inter-key intervals whatsoever. |
+| **Keystroke uniformity** | ✅ SURVIVES (this check) | `page.fill()` bypasses keydown events entirely — `keystroke_uniformity` is `null`, so this signal contributes 0. BrowserBot is still caught by mouse entropy, click latency, and JA3 — just not by this one. |
 | **Honeypot fields** | ✅ SURVIVES | BrowserBot uses semantic locators (`get_by_placeholder`, `get_by_label`). It targets fields by visible description, not by filling every DOM element. A `display:none` honeypot would never be targeted. |
 | **OTP hard friction** | ❌ CAUGHT | BrowserBot has no inbox access. It cannot retrieve or enter an OTP. Blocked. |
 
-**Conclusion:** A BrowserBot-style automation scores **60–80** from behavioral and JA3 signals alone (mouse entropy +20, click latency +10, keystroke uniformity +10, JA3 +20 = 60 minimum). If it also runs from a cloud/datacenter IP — which is common for server-deployed automation — the IP reputation check adds another +20, pushing the score to **80+ → hard block**. Even at the lower score of 60, it hits the OTP tier and gets blocked there. Either way, it doesn't get through. An attacker trying to evade would need to: add synthetic mouse movement, add random keystroke delays, use a real Chrome binary (not Playwright's bundled Chromium) to fix JA3, and route through residential proxies. Possible — but it raises cost/request by 10–100x, making bulk abuse economically unviable.
+**Conclusion:** A BrowserBot-style automation scores **60–80** from behavioral and JA3 signals alone. The reliable signals: mouse entropy +20, click latency +10, time on page +10, JA3 +20 = **60 minimum** (keystroke uniformity contributes 0 because `page.fill()` bypasses keydown events — the signal is null). If it also runs from a cloud/datacenter IP — which is common for server-deployed automation — the IP reputation check adds another +20, pushing the score to **80 → hard block**. Even at the lower score of 60, it hits the OTP tier and gets blocked there. Either way, it doesn't get through. An attacker trying to evade would need to: add synthetic mouse movement, add random keystroke delays, use a real Chrome binary (not Playwright's bundled Chromium) to fix JA3, and route through residential proxies. Possible — but it raises cost/request by 10–100x, making bulk abuse economically unviable.
 
 **The real answer for HULP:** If HULP explicitly authorizes users to automate bookings (e.g., corporate accounts), the right solution is **authenticated API tokens** — give those accounts a server-to-server API key so they bypass the browser flow entirely and never hit bot detection. Part 1 (browser automation) is a last resort for sites *without* an API. HULP should build and expose an API for its power users rather than force them through a browser layer designed for human interaction.
 
