@@ -866,15 +866,22 @@ The request receives `429` with a generic error. The attacker doesn't know if th
 ## 6. Operations: Monitoring, Alerting, Scaling, Cost
 
 ### Monitoring
-- **Score distribution histogram:** should be bimodal (most users < 30, bots > 70). If it flattens, signals are degrading.
-- **OTP trigger rate:** % of sessions hitting hard-friction tier. A spike means bot wave; a slow creep means signal drift.
-- **False positive rate:** Sessions that passed OTP but were later flagged as fraud — correlate with their score at booking time.
-- **Block rate per endpoint:** Spikes on specific endpoints signal targeted attacks.
+- **Score distribution histogram:** should be bimodal (most users < 30, bots > 70). If it flattens, signals are degrading — but a bimodal shape alone doesn't confirm the system is working correctly; it means signals are separating sessions, not that the separation is accurate.
+- **OTP trigger rate:** % of sessions hitting hard-friction tier. A spike may indicate a bot wave; a slow creep may indicate signal drift or a shifting user population. Neither is definitive without cross-referencing other metrics.
+- **Legitimate-user checkout conversion rate:** The most direct signal of false-positive harm. If conversion drops after a threshold change, real users are being caught. Track separately from raw block rate.
+- **OTP / verification failure rate:** Sessions that hit OTP but fail to complete it. High failure rate among otherwise normal-looking sessions is a false-positive signal; high failure rate among high-scored sessions is expected (bots can't retrieve OTPs).
+- **Confirmed abuse rate:** Ground truth from the fraud/ops team — bookings later confirmed as fraudulent. Correlate with their score at booking time to validate whether the scoring is actually catching real abuse, not just high-entropy sessions.
+- **False positive rate:** Sessions that passed OTP but were later flagged as fraud — correlate with their score at booking time. Also the inverse: legitimate users who were blocked and contacted support.
+- **Block rate per endpoint:** Spikes on specific endpoints suggest targeted attacks — but could also be a new client type or a deployment change. Use as an investigation trigger, not a verdict.
 
 ### Alerting
-- Block rate > 5% in any 5-minute window → possible attack wave, auto-scale filtering workers
-- OTP trigger rate > 15% → behavioral thresholds may be too aggressive, review
-- Telemetry receive rate drops below 80% → check beacon endpoint health
+
+> **These thresholds are investigation triggers, not proof of any specific condition. Each alert should prompt a human review of the relevant metrics before taking action.**
+
+- Block rate > 5% in any 5-minute window → investigate: possible attack wave, misconfigured threshold, or new traffic pattern
+- OTP trigger rate > 15% → investigate: thresholds may be too aggressive, or a legitimate user segment is being mis-scored
+- Checkout conversion drops > 2% week-over-week → investigate: possible false-positive increase harming real users
+- Telemetry receive rate drops below 80% → check beacon endpoint health; scoring will fall back to network signals only
 
 ### Scaling
 - **Telemetry ingestion:** Stateless Node.js workers behind a load balancer. Each beacon is a lightweight Redis write.
