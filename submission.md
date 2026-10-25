@@ -197,25 +197,25 @@ If all retries fail, the result string is fed back into the LLM's next plan step
 
 There's a subtle but serious problem with retrying on `TimeoutError` for booking/payment actions. A timeout means *"I didn't receive confirmation"* — not *"the action didn't execute."* If a "Confirm Booking" click times out, the booking may have already been made server-side. Retrying = double booking.
 
-The fix is to classify actions before retrying:
+The fix can't be based on action **type** alone. `click_element` appears safe by name — but `click_element("Confirm Booking")` is exactly the action that submits a payment. Classifying `click_element` as universally safe to retry is wrong.
+
+The correct approach is to reuse the same **`ActionRisk` LLM classifier** from the safety gate (section 2.6) — if the planned action was classified as `is_irreversible=True`, treat any timeout as `UNKNOWN_OUTCOME`. If `is_irreversible=False`, safe to retry:
 
 ```python
-# Actions safe to retry — no server-side side effects
-SAFE_TO_RETRY = {"navigate_to", "click_element", "extract_text", "press_key"}
-
-# Actions that may have already executed server-side — never retry blindly
-SIDE_EFFECT_ACTIONS = {"confirm_booking", "place_order", "submit_payment"}
-
-async def execute_with_smart_retry(coro, action: str, max_retries: int = 2):
-    is_safe = not any(phrase in action.lower() for phrase in SIDE_EFFECT_ACTIONS)
+async def execute_with_smart_retry(
+    coro, planned_action: BrowserAction, action_risk: ActionRisk, max_retries: int = 2
+):
+    # is_irreversible comes from the same LLM classifier used by the safety gate
+    # click_element on a payment form → is_irreversible=True
+    # navigate_to, extract_text → is_irreversible=False
 
     for attempt in range(max_retries + 1):
         try:
             return await asyncio.wait_for(coro, timeout=STEP_TIMEOUT)
 
         except asyncio.TimeoutError:
-            if not is_safe:
-                # Don't retry — outcome is unknown. Check current page state first.
+            if action_risk.is_irreversible:
+                # Don't retry — outcome is unknown. Check page state before retrying.
                 return "UNKNOWN_OUTCOME: action may have executed. Inspect page state before retrying."
             if attempt < max_retries:
                 backoff = 0.5 * (2 ** attempt)
@@ -232,6 +232,8 @@ async def execute_with_smart_retry(coro, action: str, max_retries: int = 2):
                 continue
             return f"Action failed after {max_retries + 1} attempts: {exc}"
 ```
+
+This way the safety gate and retry logic share a single source of truth for what's irreversible — no duplication, no gap where `click_element` slips through as "safe" when it's actually submitting a booking.
 
 When `UNKNOWN_OUTCOME` is returned, the LLM's next plan step receives it and should check the page state — e.g. `extract_text("booking confirmation")` or navigate to booking history — before deciding whether to retry. If the target service supports idempotency keys, they should be passed with every booking request so that even if the request hits the server twice, it's processed only once.
 
