@@ -233,7 +233,7 @@ async def execute_with_smart_retry(
             return f"Action failed after {max_retries + 1} attempts: {exc}"
 ```
 
-This way the safety gate and retry logic share a single source of truth for what's irreversible — no duplication, no gap where `click_element` slips through as "safe" when it's actually submitting a booking.
+This way the safety gate and retry logic share a single source of truth for what's irreversible — no duplication, no gap where `click_element` slips through as "safe" when it's actually submitting a booking. Importantly, if the `ActionRisk` classifier itself fails (API error), the retry logic also defaults to `UNKNOWN_OUTCOME` — never assume an action is safe to retry when classification is uncertain.
 
 When `UNKNOWN_OUTCOME` is returned, the LLM's next plan step receives it and should check the page state — e.g. `extract_text("booking confirmation")` or navigate to booking history — before deciding whether to retry. If the target service supports idempotency keys, they should be passed with every booking request so that even if the request hits the server twice, it's processed only once.
 
@@ -316,7 +316,9 @@ The correct production fix is **LLM-based intent classification** — the system
 ```python
 class ActionRisk(BaseModel):
     is_irreversible: bool
-    reason: str  # e.g. "page shows booking summary with price and a final submit form"
+    reason: str           # e.g. "page shows booking summary with price and a final submit form"
+    transaction_details: str  # human-readable summary of what will happen: "OlaCabs Mini ₹450,
+                              # Connaught Place → IGI Airport, tomorrow 8am" — bound to approval
 
 async def classify_action_risk(planned_action: BrowserAction, page_snapshot: str) -> ActionRisk:
     risk_llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0)
@@ -324,19 +326,49 @@ async def classify_action_risk(planned_action: BrowserAction, page_snapshot: str
     return await classifier.ainvoke([
         SystemMessage("You are a safety classifier. Given a planned browser action and the "
                       "current page state, decide if this action is irreversible "
-                      "(e.g. completes a booking, submits payment, places an order)."),
+                      "(e.g. completes a booking, submits payment, places an order). "
+                      "Extract the specific transaction details visible on the page "
+                      "(price, route, item, time) into transaction_details."),
         HumanMessage(f"Planned action: {planned_action}\n\nPage state:\n{page_snapshot}")
     ])
 
 # In the act node — before executing any click
 if planned_action.action == "click_element":
-    risk = await classify_action_risk(planned_action, state["page_content"])
+    try:
+        risk = await classify_action_risk(planned_action, state["page_content"])
+    except Exception:
+        # Classifier failed (API error, timeout, etc.) — fail safe: treat as irreversible.
+        # Never assume an action is safe when classification is uncertain.
+        risk = ActionRisk(is_irreversible=True, reason="classifier unavailable",
+                          transaction_details="unknown — classifier failed")
+
     if risk.is_irreversible:
-        # pause for human confirmation regardless of button type or label
-        return await request_human_confirmation(state, planned_action)
+        # Pause for human confirmation. The approval is bound to the specific
+        # transaction_details extracted from the current page — not just the action name.
+        confirmation = await request_human_confirmation(state, planned_action, risk)
+
+        # Re-read page state after approval before executing.
+        # Between approval and execution the page may have changed (session expiry,
+        # price update, different booking loaded). Revalidate before clicking.
+        current_snapshot = await get_page_snapshot(state["browser_context"])
+        recheck = await classify_action_risk(planned_action, current_snapshot)
+        if recheck.transaction_details != risk.transaction_details:
+            # Details changed — abort and notify user rather than execute on stale approval
+            raise SafetyError(
+                f"Page state changed after approval. "
+                f"Approved: {risk.transaction_details} | "
+                f"Now: {recheck.transaction_details}"
+            )
+
+        return await execute_confirmed_action(state, planned_action)
 ```
 
-The LLM sees the full page snapshot — a visible price, a booking summary, a payment form — and classifies intent accurately regardless of button type, label, or URL. A `<div>` that says "Complete your ride booking" on a page showing fare and pickup details is correctly flagged as irreversible even if it has no semantic HTML markers. This adds one LLM call before irreversible steps — a worthwhile cost given the risk of autonomous payment.
+The LLM sees the full page snapshot — a visible price, a booking summary, a payment form — and classifies intent accurately regardless of button type, label, or URL. A `<div>` that says "Complete your ride booking" on a page showing fare and pickup details is correctly flagged as irreversible even if it has no semantic HTML markers.
+
+Three properties this design enforces:
+- **Conservative default:** classifier failure → irreversible. Never assume safe when uncertain.
+- **Approval bound to details:** the user approves specific transaction details extracted from the page, not just a button name. "OlaCabs Mini ₹450, CP → IGI, tomorrow 8am" — not "click Confirm Booking."
+- **Revalidation before execution:** page state is re-read after approval. If details changed, execution is aborted rather than proceeding on a stale approval. This adds one extra page read for irreversible steps — a worthwhile cost.
 
 ---
 
