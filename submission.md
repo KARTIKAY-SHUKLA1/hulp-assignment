@@ -193,6 +193,48 @@ async def execute_with_smart_retry(coro, action: str, max_retries: int = 2):
 
 If all retries fail, the result string is fed back into the LLM's next plan step. The LLM can then decide: *"The click timed out. Let me scroll down first and try again."*
 
+**Critical production concern — don't retry side-effect actions blindly:**
+
+There's a subtle but serious problem with retrying on `TimeoutError` for booking/payment actions. A timeout means *"I didn't receive confirmation"* — not *"the action didn't execute."* If a "Confirm Booking" click times out, the booking may have already been made server-side. Retrying = double booking.
+
+The fix is to classify actions before retrying:
+
+```python
+# Actions safe to retry — no server-side side effects
+SAFE_TO_RETRY = {"navigate_to", "click_element", "extract_text", "press_key"}
+
+# Actions that may have already executed server-side — never retry blindly
+SIDE_EFFECT_ACTIONS = {"confirm_booking", "place_order", "submit_payment"}
+
+async def execute_with_smart_retry(coro, action: str, max_retries: int = 2):
+    is_safe = not any(phrase in action.lower() for phrase in SIDE_EFFECT_ACTIONS)
+
+    for attempt in range(max_retries + 1):
+        try:
+            return await asyncio.wait_for(coro, timeout=STEP_TIMEOUT)
+
+        except asyncio.TimeoutError:
+            if not is_safe:
+                # Don't retry — outcome is unknown. Check current page state first.
+                return "UNKNOWN_OUTCOME: action may have executed. Inspect page state before retrying."
+            if attempt < max_retries:
+                backoff = 0.5 * (2 ** attempt)
+                await asyncio.sleep(backoff)
+                continue
+            return f"Action timed out after {max_retries + 1} attempts"
+
+        except Exception as exc:
+            err = str(exc).lower()
+            if any(phrase in err for phrase in ["not found", "could not find", "no element"]):
+                return f"Element not found — skipping retries: {exc}"
+            if attempt < max_retries:
+                await asyncio.sleep(0.5 * (2 ** attempt))
+                continue
+            return f"Action failed after {max_retries + 1} attempts: {exc}"
+```
+
+When `UNKNOWN_OUTCOME` is returned, the LLM's next plan step receives it and should check the page state — e.g. `extract_text("booking confirmation")` or navigate to booking history — before deciding whether to retry. If the target service supports idempotency keys, they should be passed with every booking request so that even if the request hits the server twice, it's processed only once.
+
 ### 2.5 LLM JSON Recovery — and Why I'd Do It Differently in Production
 
 In BrowserBot, I handle malformed LLM JSON with two regex-based recovery layers:
