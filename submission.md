@@ -281,7 +281,7 @@ structured_llm = llm.with_structured_output(BrowserAction)
 planned_action: BrowserAction = await structured_llm.ainvoke(messages)
 ```
 
-Gemini Flash 2.0 supports structured outputs natively. With structured outputs, `json.JSONDecodeError` becomes impossible — the LLM is constrained to return a valid schema at the API level. No sanitization, no regex recovery needed.
+Gemini Flash 2.0 supports structured outputs natively. With structured outputs, the LLM is constrained to return a valid schema at the API level — this eliminates the most common source of `json.JSONDecodeError`. That said, API failures, timeouts, and application-side schema validation errors can still occur. Structured outputs reduce malformed-response risk; they don't remove the need for error handling. No regex sanitization needed for the happy path, but a validation + graceful fallback layer is still required.
 
 > **Note:** In my BrowserBot side project I used Groq + Llama-3.3-70b with manual regex JSON recovery — that worked fine for a prototype. For HULP's production system, structured outputs is the right approach. Gemini Flash 2.0 also has vision capability as a last-resort fallback: in the rare case where both text-based semantic locators AND LLM text re-planning fail (e.g., an icon-only button with no text or ARIA label), a screenshot can be passed to the LLM to locate elements visually. This covers maybe 5% of edge cases — Layers 1 and 2 handle the other 95%.
 
@@ -455,7 +455,7 @@ Script crashes. Engineer gets paged at 2am. Script is manually patched. Repeat n
 
 | Failure | Detection | Recovery | What I chose NOT to handle |
 |---|---|---|---|
-| **LLM gives malformed JSON** | `json.JSONDecodeError` | Production fix: use Gemini Flash 2.0's structured outputs — LLM is forced to return a valid schema, JSON errors become impossible. (In BrowserBot I used regex recovery as a prototype approach — works but fragile) | Fully corrupted API responses — just fail gracefully |
+| **LLM gives malformed JSON** | `json.JSONDecodeError` | Production fix: use Gemini Flash 2.0's structured outputs — LLM is constrained to return a valid schema, reducing malformed-response risk significantly. Schema validation and error handling are still required for API failures and edge cases. (In BrowserBot I used regex recovery as a prototype approach — works but fragile) | Fully corrupted API responses — just fail gracefully |
 | **Action timeout (15s)** | `asyncio.TimeoutError` | Retry up to 2× with 0.5s backoff | Retries beyond 2× (diminishing returns, costs tokens) |
 | **Token budget exceeded** | `tokens_used > 15,000` | Force `END`, return what's collected so far | Open-ended tasks that legitimately need more tokens — those should be broken into sub-tasks |
 | **Site uses CAPTCHA** | Body text contains "CAPTCHA"/"verify" | LLM notes it in final_answer | Auto-solving CAPTCHAs (out of scope, ethically questionable) |
