@@ -5,9 +5,9 @@
 
 ## Preface
 
-Before diving in — I built something directly relevant before this assignment: **[BrowserBot](https://github.com/KARTIKAY-SHUKLA1/BrowserBot)**, an autonomous AI browser agent (LangGraph, Playwright, Llama-3.3-70b) that navigates real websites from a natural-language goal with no public API. It's on my resume.
+One of my personal projects — **[BrowserBot](https://github.com/KARTIKAY-SHUKLA1/BrowserBot)** — is already on my resume and happens to be directly relevant to both parts of this assignment. It's an autonomous AI browser agent (LangGraph, Playwright, Llama-3.3-70b) that navigates real websites from a natural-language goal with no public API.
 
-It gave me hands-on experience on both sides of this problem. For Part 1 — I had to make it resilient to real websites; Flipkart works reliably, Amazon blocks it, and I know exactly why. For Part 2 — because I built a bot, I know firsthand what signals betray automation. That's not something I read about.
+Building it gave me hands-on experience on both sides. For Part 1 — I had to make it resilient to real websites; Flipkart works reliably, Amazon blocks it, and I know exactly why. For Part 2 — because I built a bot, I know firsthand what signals betray automation. That's not something I read about.
 
 I'll use **online service booking** (cab booking, home services) as the domain throughout — directly what HULP does.
 
