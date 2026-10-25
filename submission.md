@@ -663,6 +663,7 @@ class TelemetryCollector {
     constructor(sessionId) {
         this.sessionId = sessionId;
         this.signals = { mousePoints: [], clickTimings: [], keyTimings: [] };
+        this.pageLoadTime = performance.timing.navigationStart;
         this._attachListeners();
     }
 
@@ -673,10 +674,14 @@ class TelemetryCollector {
         document.addEventListener('keydown', () => {
             this.signals.keyTimings.push(Date.now());
         });
+        // Bug fix: click listener was missing — clickTimings was always empty
+        document.addEventListener('click', () => {
+            this.signals.clickTimings.push(Date.now());
+        });
     }
 
     computeMouseEntropy() {
-        // Shannon entropy of direction-change angles between consecutive mouse points
+        if (this.signals.mousePoints.length < 3) return null;  // not enough data
         const angles = [];
         for (let i = 2; i < this.signals.mousePoints.length; i++) {
             const dx1 = this.signals.mousePoints[i-1].x - this.signals.mousePoints[i-2].x;
@@ -691,18 +696,27 @@ class TelemetryCollector {
     beacon() {
         const timings = this.signals.keyTimings;
         const intervals = timings.slice(1).map((t, i) => t - timings[i]);
-        const uniformity = intervals.length > 1
+        // Return null when signal is unavailable — don't compute from missing data
+        const keystrokeUniformity = intervals.length > 1
             ? 1 - (stddev(intervals) / mean(intervals))
-            : 0;
+            : null;  // null = signal unavailable (e.g. page.fill() bypasses keydown events)
+
+        const firstClick = this.signals.clickTimings[0];
+        const clickLatency = firstClick !== undefined
+            ? firstClick - this.pageLoadTime
+            : null;  // null = no click recorded yet
 
         navigator.sendBeacon('/api/telemetry', JSON.stringify({
             sessionId: this.sessionId,
-            mouseEntropy: this.computeMouseEntropy(),
-            clickLatency: this.signals.clickTimings[0] - performance.timing.navigationStart,
-            keystrokeUniformity: uniformity
+            mouseEntropy: this.computeMouseEntropy(),   // null if < 3 mouse points
+            clickLatency,                               // null if no click recorded
+            keystrokeUniformity                         // null if < 2 key intervals
         }));
     }
 }
+```
+
+> **Note on null signals and scoring:** When a signal arrives as `null`, the scoring engine skips that signal rather than treating it as a specific value. A bot using `page.fill()` bypasses `keydown` events entirely — `keystrokeUniformity` arrives as `null` and contributes 0 points, not +10. This is conservative: missing behavioral signals don't inflate the score. The network and temporal signals (JA3, IP, time-on-page) still fire independently and catch the bot through other dimensions.
 ```
 
 **Redis session state:**
