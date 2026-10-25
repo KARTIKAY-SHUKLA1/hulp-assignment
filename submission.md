@@ -851,6 +851,55 @@ app.post('/api/telemetry', async (req, res) => {
 });
 ```
 
+**Checkout enforcement endpoint:**
+
+```javascript
+// POST /api/bookings  — called when user submits a booking
+app.post('/api/bookings', async (req, res) => {
+    // Session ID comes from a server-set HttpOnly cookie — never from the request body.
+    // A client-supplied risk score would be trivially spoofable; only the server-side
+    // Redis value (written by the telemetry endpoint) is trusted.
+    const sessionId = req.cookies.sessionId;
+    if (!sessionId) return res.status(401).json({ error: 'No session' });
+
+    // Retrieve the score the telemetry endpoint computed and stored.
+    // If the beacon never arrived (ad blocker, no JS), score is null — fall back to
+    // network-only signals computed fresh here.
+    const rawScore = await redis.get(`session:${sessionId}:score`);
+    const score = rawScore !== null
+        ? parseInt(rawScore)
+        : computeNetworkOnlyScore(req);   // JA3 + IP only — no behavioral signals
+
+    // Apply tiered policy
+    if (score >= 80) {
+        // Hard block — don't reveal the reason
+        return res.status(429).json({ error: 'Request could not be completed. Please try again later.' });
+    }
+
+    if (score >= 60) {
+        // Hard friction — require OTP before proceeding
+        const otpVerified = await redis.get(`session:${sessionId}:otp_verified`);
+        if (!otpVerified) {
+            await sendOTP(req.user.phone);
+            return res.status(202).json({ status: 'otp_required', message: 'Verification sent.' });
+        }
+    }
+
+    if (score >= 30) {
+        // Soft friction — add artificial delay to slow bulk abuse
+        await new Promise(r => setTimeout(r, 500));
+    }
+
+    // Score < 80 and OTP satisfied (if needed) — process the booking
+    await redis.incr(`ip:${req.ip}:orders:1h`);
+    await redis.expire(`ip:${req.ip}:orders:1h`, 3600);
+    const booking = await createBooking(req.body, req.user);
+    return res.status(201).json({ booking });
+});
+```
+
+The key properties: the score is read from Redis using a server-set session ID — the client has no way to supply or modify it. Sessions with no telemetry aren't assumed safe; they're scored on network signals alone. Each tier enforces a concrete policy rather than just logging.
+
 ---
 
 ## 4. Worked Examples
