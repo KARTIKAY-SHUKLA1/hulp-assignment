@@ -494,7 +494,7 @@ Script crashes. Engineer gets paged at 2am. Script is manually patched. Repeat n
 | Failure | Detection | Recovery | What I chose NOT to handle |
 |---|---|---|---|
 | **LLM gives malformed JSON** | `json.JSONDecodeError` | Production fix: use Gemini Flash 2.0's structured outputs — LLM is constrained to return a valid schema, reducing malformed-response risk significantly. Schema validation and error handling are still required for API failures and edge cases. (In BrowserBot I used regex recovery as a prototype approach — works but fragile) | Fully corrupted API responses — just fail gracefully |
-| **Action timeout (15s)** | `asyncio.TimeoutError` | Retry up to 2× with 0.5s backoff | Retries beyond 2× (diminishing returns, costs tokens) |
+| **Action timeout (15s)** | `asyncio.TimeoutError` | Retryable actions: retry up to 2× with exponential backoff (0.5s → 1s). Irreversible actions (`is_irreversible=True`): return `UNKNOWN_OUTCOME` immediately — outcome must be verified from page state before any retry is attempted | Retries beyond 2× (diminishing returns, costs tokens) |
 | **Token budget exceeded** | `tokens_used > 15,000` | Force `END`, return what's collected so far | Open-ended tasks that legitimately need more tokens — those should be broken into sub-tasks |
 | **Site uses CAPTCHA** | Body text contains "CAPTCHA"/"verify" | LLM notes it in final_answer | Auto-solving CAPTCHAs (out of scope, ethically questionable) |
 | **Site blocks bot fingerprint** | `navigate_to` returns error page | LLM notes it; try alternative URL | Full stealth mode (out of scope for this system) |
