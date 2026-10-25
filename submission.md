@@ -583,10 +583,10 @@ The key insight: **don't try to detect bots at one point in time — build a con
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Policy Enforcement Layer                      │
 │                                                                 │
-│   Score 0–30  → Allow (trusted)                                 │
-│   Score 30–60 → Soft friction (add delay, shadow-limit)         │
-│   Score 60–80 → Hard friction (require email OTP for checkout)  │
-│   Score 80+   → Block + log for review                          │
+│   Score  0–29  → Allow (trusted)                                 │
+│   Score 30–59  → Soft friction (add delay, shadow-limit)         │
+│   Score 60–79  → Hard friction (require email OTP for checkout)  │
+│   Score 80–100 → Block + log for review                          │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -677,7 +677,7 @@ These thresholds are starting points — they're set conservatively to minimize 
 
 **Important: these are probabilistic signals, not proof.** A keyboard-only user generates zero mouse events — `computeMouseEntropy()` returns `null` (fewer than 3 points), so the signal is skipped and contributes 0 to score, not +20. A user with a password manager auto-filling may have low click latency. Assistive technology users behave differently from both typical humans and bots. None of these signals alone is proof of automation.
 
-This is why the tiered response matters: **no single signal triggers a block.** To reach score 80+ (block), a session needs to trip multiple independent signals — e.g. zero mouse entropy AND a known bot JA3 AND datacenter IP. A keyboard-only user on a residential connection with a real browser JA3 scores at most 20-30 (allow or soft friction). Hard restrictions only fire when several unrelated signals converge. Thresholds must be calibrated against real HULP traffic before deployment — what looks like a bot threshold in theory may cut into real user segments in practice.
+This is why the tiered response matters: **no single signal triggers a block.** To reach score 80–100 (block), a session needs to trip multiple independent signals — e.g. zero mouse entropy AND a known bot JA3 AND datacenter IP. A keyboard-only user on a residential connection with a real browser JA3 scores at most 20–29 (allow) or at most 30–59 (soft friction). Hard restrictions only fire when several unrelated signals converge. Thresholds must be calibrated against real HULP traffic before deployment — what looks like a bot threshold in theory may cut into real user segments in practice.
 
 **Signal correlation caveat:** The additive scoring model implicitly treats each signal as independent evidence, but that's not always true. `mouse_entropy = 0` and `click_latency < 100ms` often share the same root cause — a Playwright synthetic click — so scoring +20 + +10 isn't 30 points of separate evidence, it's one fact counted twice. Similarly, `ip_in_datacenter_range` and `ja3_matches_known_bot` frequently co-occur (bots deployed on cloud infra tend to also use Playwright's bundled Chromium). The additive model with a hard cap at `min(score, 100)` is a known simplification — it's the same approach used by Stripe Radar v1 and most early rule-based fraud systems. It works well enough in practice because correlated signals that share a root cause are still *evidence* of that cause, even if double-counting inflates the magnitude. The v2 ML upgrade (XGBoost/LightGBM) handles feature correlation naturally — the model learns that mouse entropy and click latency together aren't 2× the evidence of either alone.
 
@@ -689,20 +689,20 @@ Once the audit log accumulates enough labeled data (blocked sessions confirmed a
 ### 2.3 Tiered Response (No CAPTCHAs)
 
 ```
-Score 0–30:   ALLOW
+Score  0–29:  ALLOW
               Normal flow, no friction
 
-Score 30–60:  SOFT FRICTION
+Score 30–59:  SOFT FRICTION
               - Add 500ms artificial delay on API responses (slows down high-volume bots)
               - Shadow-rate-limit: the request IS accepted and queued, but processed with lowest priority. From the user's perspective, the booking is "processing" — real users wait a few seconds and get their result. For high-volume bots running hundreds of parallel requests, the artificial throughput cap makes bulk abuse economically slow. The session is flagged for async human review.
               - Log session for async review
 
-Score 60–80:  HARD FRICTION
+Score 60–79:  HARD FRICTION
               - Require email/phone OTP before checkout
               - This is invisible to a real user who has their phone nearby
               - A bot has no access to the OTP inbox → blocked effectively
 
-Score 80+:    BLOCK
+Score 80–100: BLOCK
               - Return 429 with a generic message ("Something went wrong")
               - Log full session for IP-level block review
               - Don't tell the bot WHY it was blocked (adversarial hardening)
@@ -713,7 +713,7 @@ Score 80+:    BLOCK
 2. Have known weaknesses (ML-based CAPTCHA solvers, CAPTCHA farms)
 3. Hurt conversion rates — research consistently shows they cost ~10% of legitimate completions
 
-The OTP step (score 60–80) acts as a targeted challenge only for high-risk sessions. It's also something real users are already comfortable with for security reasons.
+The OTP step (score 60–79) acts as a targeted challenge only for high-risk sessions. It's also something real users are already comfortable with for security reasons.
 
 ### 2.4 TLS Fingerprinting (JA3)
 
@@ -1065,7 +1065,7 @@ A determined attacker could invest in evading individual signals, but each layer
 |---|---|---|
 | **Core idea** | LLM re-plans from observed page state; semantic locators resist UI changes | Multi-signal passive scoring; tiered friction for high-risk sessions only |
 | **Key resilience** | Semantic waterfall + retry + LLM JSON recovery | JA3 fingerprinting + behavioral entropy + OTP gate |
-| **Human in the loop** | Yes — payment actions require explicit confirmation | Yes — OTP only for sessions scoring 60–80 |
+| **Human in the loop** | Yes — payment actions require explicit confirmation | Yes — OTP only for sessions scoring 60–79 |
 | **Biggest weakness** | JA3 fingerprint betrays Playwright even with spoofed UA | Residential proxies + synthetic mouse movement lower the score |
 | **Monitoring signal** | Run completion rate | Score distribution histogram |
 
