@@ -816,7 +816,7 @@ app.post('/api/telemetry', async (req, res) => {
 3. Click latency = 1,240ms — clearly human
 4. JA3 matches real Chrome mobile fingerprint
 5. IP is a residential Airtel connection (not datacenter)
-6. **Score: 8 → ALLOW**
+6. **Score: 0 → ALLOW**
 7. User completes booking with zero friction. No awareness of any defense layer.
 
 ---
