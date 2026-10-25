@@ -307,26 +307,34 @@ The whole point is: you never auto-pay on someone's behalf without them explicit
 
 The regex matches against the **LLM's text description** of the action, not the actual element on the page. This is a weak security boundary — a site labelling its payment button "Proceed", "Go!", or "Next →" would bypass the regex entirely. The LLM might also describe the action loosely ("click the green button") and miss the match.
 
-The production fix is to enforce the gate at the **execution layer**, after the element is resolved but before it's clicked:
+A keyword-based execution-layer check (is this a `submit` button? does the URL contain "checkout"?) improves things but still fails when a booking action uses a `<div onclick>` with an unexpected label, or the URL is `/step/3` with no payment keywords.
+
+The correct production fix is **LLM-based intent classification** — the system already has an LLM in the loop, so use it. Before executing any click action, ask the LLM whether the planned action is irreversible given the full current page context:
 
 ```python
-async def should_require_approval(element, page) -> bool:
-    element_text = (await element.inner_text()).lower()
-    element_type = await element.get_attribute("type")
-    page_context = (page.url + await page.title()).lower()
+class ActionRisk(BaseModel):
+    is_irreversible: bool
+    reason: str  # e.g. "page shows booking summary with price and a final submit form"
 
-    is_submit_button = element_type == "submit"
-    is_payment_page = any(kw in page_context for kw in
-                          ["checkout", "payment", "confirm", "booking", "pay"])
-    has_payment_text = any(kw in element_text for kw in
-                           ["proceed", "confirm", "pay", "book", "order"])
+async def classify_action_risk(planned_action: BrowserAction, page_snapshot: str) -> ActionRisk:
+    risk_llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0)
+    classifier = risk_llm.with_structured_output(ActionRisk)
+    return await classifier.ainvoke([
+        SystemMessage("You are a safety classifier. Given a planned browser action and the "
+                      "current page state, decide if this action is irreversible "
+                      "(e.g. completes a booking, submits payment, places an order)."),
+        HumanMessage(f"Planned action: {planned_action}\n\nPage state:\n{page_snapshot}")
+    ])
 
-    # Gate fires when element is a submit button on a payment-context page
-    # regardless of what the LLM described it as
-    return is_submit_button and (is_payment_page or has_payment_text)
+# In the act node — before executing any click
+if planned_action.action == "click_element":
+    risk = await classify_action_risk(planned_action, state["page_content"])
+    if risk.is_irreversible:
+        # pause for human confirmation regardless of button type or label
+        return await request_human_confirmation(state, planned_action)
 ```
 
-This catches "Proceed", "Go!", "Next →" on a checkout page that the regex would miss — because it checks what's actually on the page, not what the LLM wrote.
+The LLM sees the full page snapshot — a visible price, a booking summary, a payment form — and classifies intent accurately regardless of button type, label, or URL. A `<div>` that says "Complete your ride booking" on a page showing fare and pickup details is correctly flagged as irreversible even if it has no semantic HTML markers. This adds one LLM call before irreversible steps — a worthwhile cost given the risk of autonomous payment.
 
 ---
 
