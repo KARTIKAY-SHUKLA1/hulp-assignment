@@ -834,7 +834,8 @@ class TelemetryCollector {
             // Sending it here would allow a client to target any session key.
             mouseEntropy: this.computeMouseEntropy(),   // null if < 3 mouse points
             clickLatency,                               // null if no click recorded
-            keystrokeUniformity                         // null if < 2 key intervals
+            keystrokeUniformity,                        // null if < 2 key intervals
+            timeOnPageSec: Math.floor((Date.now() - this.pageLoadTime) / 1000)
         }));
     }
 }
@@ -869,7 +870,7 @@ app.post('/api/telemetry', async (req, res) => {
     // Behavioral signals come from the client — treat as untrusted evidence, not proof.
     // A bot can send { mouseEntropy: 0.73, clickLatency: 1240 } to appear human.
     // These signals influence the score but cannot override the server-side anchors below.
-    const { mouseEntropy, clickLatency, keystrokeUniformity } = req.body;
+    const { mouseEntropy, clickLatency, keystrokeUniformity, timeOnPageSec } = req.body;
 
     // Server-side signals — not supplied by the client, cannot be fabricated via req.body.
     // JA3 is extracted by nginx from the TLS handshake; IP is from the network layer.
@@ -881,8 +882,8 @@ app.post('/api/telemetry', async (req, res) => {
     const ordersThisHour = parseInt(await redis.get(`ip:${ip}:orders:1h`) || '0');
 
     const score = computeRiskScore({
-        mouseEntropy, clickLatency, keystrokeUniformity,  // client-supplied, untrusted
-        isDatacenterIP, isKnownBotJA3, ordersThisHour    // server-side, authoritative
+        mouseEntropy, clickLatency, keystrokeUniformity, timeOnPageSec,  // client-supplied, untrusted
+        isDatacenterIP, isKnownBotJA3, ordersThisHour                    // server-side, authoritative
     });
 
     await redis.set(`session:${sessionId}:score`, score, 'EX', 1800);
