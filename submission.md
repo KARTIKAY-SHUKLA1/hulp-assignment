@@ -1047,7 +1047,7 @@ This is the most interesting question.
 
 **Would BrowserBot (Part 1) be caught by the Part 2 defenses?**
 
-Honestly — **yes, mostly.** And that's by design.
+Honestly — **yes, it gets blocked.** It survives a few individual signal checks, but click latency, JA3 fingerprint, and OTP hard friction together ensure it cannot complete a checkout.
 
 | Part 2 Defense | BrowserBot's Fate | Why |
 |---|---|---|
