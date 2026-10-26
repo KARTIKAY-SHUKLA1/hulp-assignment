@@ -900,7 +900,10 @@ app.post('/api/telemetry', async (req, res) => {
 
 ```javascript
 // POST /api/bookings  — called when user submits a booking
-app.post('/api/bookings', async (req, res) => {
+// This endpoint sits behind authentication middleware (e.g. requireAuth) that populates
+// req.user from a verified JWT or session token. req.user.phone is a verified phone number
+// stored at account creation — not a client-supplied value from this request.
+app.post('/api/bookings', requireAuth, async (req, res) => {
     // Session ID comes from a server-set HttpOnly cookie — never from the request body.
     // A client-supplied risk score would be trivially spoofable; only the server-side
     // Redis value (written by the telemetry endpoint) is trusted.
@@ -928,6 +931,10 @@ app.post('/api/bookings', async (req, res) => {
         // Hard friction — require OTP before proceeding
         const otpVerified = await redis.get(`session:${sessionId}:otp_verified`);
         if (!otpVerified) {
+            // req.user.phone is populated by requireAuth middleware — guard defensively
+            if (!req.user?.phone) {
+                return res.status(401).json({ error: 'Authentication required' });
+            }
             await sendOTP(req.user.phone);
             return res.status(202).json({ status: 'otp_required', message: 'Verification sent.' });
         }
